@@ -1,0 +1,7 @@
+# ID_pixel = nume_față
+1	sec0_panta1
+2	sec0_panta2
+3	sec0_piramida_left_tri1
+4	sec0_piramida_left_tri2
+5	sec0_piramida_right_tri1
+6	sec0_piramida_right_tri2

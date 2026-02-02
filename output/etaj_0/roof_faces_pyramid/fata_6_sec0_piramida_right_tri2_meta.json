@@ -1,0 +1,11 @@
+{
+  "face_id": 6,
+  "label": "sec0_piramida_right_tri2",
+  "width_units": 375.17,
+  "height_units": 308.5,
+  "area_units_sq": 57870.71,
+  "width_px": 384,
+  "height_px": 317,
+  "units": "pixels (same as input plan)",
+  "scale": "1 px in image = 1 unit in 3D (true unfolded dimensions)"
+}

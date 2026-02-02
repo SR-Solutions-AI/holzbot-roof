@@ -1,0 +1,11 @@
+{
+  "face_id": 6,
+  "label": "sec2_fata2",
+  "width_units": 216.0,
+  "height_units": 334.29,
+  "area_units_sq": 72205.73,
+  "width_px": 224,
+  "height_px": 343,
+  "units": "pixels (same as input plan)",
+  "scale": "1 px in image = 1 unit in 3D (true unfolded dimensions)"
+}

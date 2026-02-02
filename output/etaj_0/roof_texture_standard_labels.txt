@@ -1,0 +1,7 @@
+# ID_pixel = nume_față
+1	sec0_fata1
+2	sec0_fata2
+3	sec1_fata1
+4	sec1_fata2
+5	sec2_fata1
+6	sec2_fata2

@@ -1,0 +1,11 @@
+{
+  "face_id": 7,
+  "label": "sec1_panta1",
+  "width_units": 360.0,
+  "height_units": 202.65,
+  "area_units_sq": 49243.94,
+  "width_px": 368,
+  "height_px": 211,
+  "units": "pixels (same as input plan)",
+  "scale": "1 px in image = 1 unit in 3D (true unfolded dimensions)"
+}
