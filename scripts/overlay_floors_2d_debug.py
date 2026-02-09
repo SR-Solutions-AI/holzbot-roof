@@ -54,6 +54,12 @@ def _bbox_center(bbox: Tuple[int, int, int, int]) -> Tuple[float, float]:
     return ((minx + maxx) / 2.0, (miny + maxy) / 2.0)
 
 
+def _bbox_center_int(bbox: Tuple[int, int, int, int]) -> Tuple[int, int]:
+    """Centre întreg (pixel-perfect)."""
+    minx, miny, maxx, maxy = bbox
+    return ((minx + maxx) // 2, (miny + maxy) // 2)
+
+
 def _bbox_same_size(b1: Tuple[int, int, int, int], b2: Tuple[int, int, int, int], tol: int = SAME_RECT_TOLERANCE) -> bool:
     w1, h1 = b1[2] - b1[0], b1[3] - b1[1]
     w2, h2 = b2[2] - b2[0], b2[3] - b2[1]
@@ -150,18 +156,19 @@ def generate_overlay_debug_image(
     bbox_heights = [b[3]-b[1] for b in bboxes]
     cw = max(bbox_widths) + 2 * padding
     ch = max(bbox_heights) + 2 * padding
-    ref_cx, ref_cy = cw / 2.0, ch / 2.0
+    ref_cx = int(round(cw / 2))
+    ref_cy = int(round(ch / 2))
 
     canvas = np.ones((ch, cw, 3), dtype=np.uint8) * 255
-    cv2.line(canvas, (int(ref_cx)-25, int(ref_cy)), (int(ref_cx)+25, int(ref_cy)), (100, 100, 100), 2)
-    cv2.line(canvas, (int(ref_cx), int(ref_cy)-25), (int(ref_cx), int(ref_cy)+25), (100, 100, 100), 2)
-    cv2.putText(canvas, "ref (centru canvas)", (int(ref_cx)-60, int(ref_cy)-35), font, 0.5, (80, 80, 80), 1)
+    cv2.line(canvas, (ref_cx-25, ref_cy), (ref_cx+25, ref_cy), (100, 100, 100), 2)
+    cv2.line(canvas, (ref_cx, ref_cy-25), (ref_cx, ref_cy+25), (100, 100, 100), 2)
+    cv2.putText(canvas, "ref (centru canvas)", (ref_cx-60, ref_cy-35), font, 0.5, (80, 80, 80), 1)
 
     for idx, (bbox, img, color) in enumerate(zip(bboxes, floor_images, colors)):
         minx, miny, maxx, maxy = bbox
-        bbox_cx, bbox_cy = _bbox_center(bbox)
-        ox = int(round(ref_cx - bbox_cx))
-        oy = int(round(ref_cy - bbox_cy))
+        bbox_cx, bbox_cy = _bbox_center_int(bbox)
+        ox = ref_cx - bbox_cx
+        oy = ref_cy - bbox_cy
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
         filled = flood_fill_interior(gray)
@@ -175,7 +182,7 @@ def generate_overlay_debug_image(
         rx1, ry1 = ox + minx, oy + miny
         rx2, ry2 = ox + maxx, oy + maxy
         cv2.rectangle(canvas, (rx1, ry1), (rx2, ry2), color, 2)
-        cv2.circle(canvas, (ox + int(bbox_cx), oy + int(bbox_cy)), 6, color, -1)
+        cv2.circle(canvas, (ox + bbox_cx, oy + bbox_cy), 6, color, -1)
         cv2.putText(canvas, f"E{idx+1}", (rx1, ry1 - 5), font, 0.5, color, 1)
 
     scale = 1.0

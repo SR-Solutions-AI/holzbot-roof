@@ -78,14 +78,16 @@ def _build_pyramid_end_tris(
     return [[apex, eave_corner1, eave_mid], [apex, eave_mid, eave_corner2]]
 
 
-def _roof_section_faces_pyramid(
+def _roof_section_faces_shed(
     sec: Dict[str, Any],
     base_z: float,
     roof_angle_rad: float,
-    free_ends: Dict[str, bool],
-    upper_floor_sections: Optional[List[Dict[str, Any]]],
+    high_side: str,
 ) -> List[List[List[float]]]:
-    """Returnează listă de fețe (fiecare față = listă de 3 sau 4 puncte [x,y,z])."""
+    """
+    Acoperiș într-o apă (o singură pantă).
+    high_side: "top" | "bottom" | "left" | "right" - latura unde e creasta (partea mai înaltă).
+    """
     faces: List[List[List[float]]] = []
     bounding_rect = sec.get("bounding_rect", [])
     if len(bounding_rect) < 3:
@@ -94,15 +96,90 @@ def _roof_section_faces_pyramid(
     maxx = max(p[0] for p in bounding_rect)
     miny = min(p[1] for p in bounding_rect)
     maxy = max(p[1] for p in bounding_rect)
-    ridge_line = sec.get("ridge_line", [])
-    if len(ridge_line) >= 2:
-        ridge_mid_x = (ridge_line[0][0] + ridge_line[1][0]) / 2
-        ridge_mid_y = (ridge_line[0][1] + ridge_line[1][1]) / 2
+
+    # Span = distanța perpendiculară pe latura înaltă până la latura opusă
+    if high_side in ("top", "bottom"):
+        span = float(maxy - miny)
     else:
-        ridge_mid_x = (minx + maxx) / 2
-        ridge_mid_y = (miny + maxy) / 2
+        span = float(maxx - minx)
+    if span <= 0:
+        return faces
+    ridge_z = base_z + span * float(np.tan(roof_angle_rad))
+
+    # Un singur plan înclinat: 4 colțuri, 2 la ridge_z (latura înaltă), 2 la base_z (latura jos)
+    def z_at(x: float, y: float) -> float:
+        if high_side == "top":
+            # high la y=miny, low la y=maxy
+            t = (maxy - y) / span if span > 0 else 0
+        elif high_side == "bottom":
+            t = (y - miny) / span if span > 0 else 0
+        elif high_side == "left":
+            t = (maxx - x) / span if span > 0 else 0
+        else:  # right
+            t = (x - minx) / span if span > 0 else 0
+        t = max(0, min(1, t))
+        return base_z + t * (ridge_z - base_z)
+
+    # Un dreptunghi înclinat ca față unică (2 triunghiuri pentru convex)
+    corners = [
+        [minx, miny, z_at(minx, miny)],
+        [maxx, miny, z_at(maxx, miny)],
+        [maxx, maxy, z_at(maxx, maxy)],
+        [minx, maxy, z_at(minx, maxy)],
+    ]
+    faces.append([corners[0], corners[1], corners[2], corners[3]])
+    return faces
+
+
+def _roof_section_faces_pyramid(
+    sec: Dict[str, Any],
+    base_z: float,
+    roof_angle_rad: float,
+    free_ends: Dict[str, bool],
+    upper_floor_sections: Optional[List[Dict[str, Any]]],
+    base_sec_for_ridge: Optional[Dict[str, Any]] = None,
+) -> List[List[List[float]]]:
+    """Returnează listă de fețe (fiecare față = listă de 3 sau 4 puncte [x,y,z]).
+
+    base_sec_for_ridge: când există overhang, se folosește geometria inițială (fără overhang)
+    pentru ridge_height și ridge_mid, astfel încât vârful piramidei să rămână corect.
+    Colțurile fețelor (minx,maxx,miny,maxy) provin din sec (cu overhang extins).
+    """
+    faces: List[List[List[float]]] = []
+    bounding_rect = sec.get("bounding_rect", [])
+    if len(bounding_rect) < 3:
+        return faces
+    minx = min(p[0] for p in bounding_rect)
+    maxx = max(p[0] for p in bounding_rect)
+    miny = min(p[1] for p in bounding_rect)
+    maxy = max(p[1] for p in bounding_rect)
     orientation = sec.get("ridge_orientation", "horizontal")
-    span_width = (maxy - miny) / 2 if orientation == "horizontal" else (maxx - minx) / 2
+
+    # Pentru ridge: folosim geometria de bază (fără overhang) dacă e dată
+    use_for_ridge = base_sec_for_ridge if base_sec_for_ridge is not None else sec
+    rect_ridge = use_for_ridge.get("bounding_rect", [])
+    if len(rect_ridge) >= 3:
+        rx_min = min(p[0] for p in rect_ridge)
+        rx_max = max(p[0] for p in rect_ridge)
+        ry_min = min(p[1] for p in rect_ridge)
+        ry_max = max(p[1] for p in rect_ridge)
+        ridge_line = use_for_ridge.get("ridge_line", [])
+        if len(ridge_line) >= 2:
+            ridge_mid_x = (ridge_line[0][0] + ridge_line[1][0]) / 2
+            ridge_mid_y = (ridge_line[0][1] + ridge_line[1][1]) / 2
+        else:
+            ridge_mid_x = (rx_min + rx_max) / 2
+            ridge_mid_y = (ry_min + ry_max) / 2
+        span_width = (ry_max - ry_min) / 2 if orientation == "horizontal" else (rx_max - rx_min) / 2
+    else:
+        ridge_line = sec.get("ridge_line", [])
+        if len(ridge_line) >= 2:
+            ridge_mid_x = (ridge_line[0][0] + ridge_line[1][0]) / 2
+            ridge_mid_y = (ridge_line[0][1] + ridge_line[1][1]) / 2
+        else:
+            ridge_mid_x = (minx + maxx) / 2
+            ridge_mid_y = (miny + maxy) / 2
+        span_width = (maxy - miny) / 2 if orientation == "horizontal" else (maxx - minx) / 2
     ridge_height = base_z + span_width * np.tan(roof_angle_rad)
     ends_adjacent_upper = _ends_adjacent_to_upper_floor(sec, upper_floor_sections or [])
 

@@ -162,6 +162,12 @@ def _bbox_center(bbox: Tuple[int, int, int, int]) -> Tuple[float, float]:
     return ((minx + maxx) / 2.0, (miny + maxy) / 2.0)
 
 
+def _bbox_center_int(bbox: Tuple[int, int, int, int]) -> Tuple[int, int]:
+    """Centre întreg (pixel-perfect) al bbox."""
+    minx, miny, maxx, maxy = bbox
+    return ((minx + maxx) // 2, (miny + maxy) // 2)
+
+
 def _bbox_same_size(
     bbox1: Tuple[int, int, int, int],
     bbox2: Tuple[int, int, int, int],
@@ -269,14 +275,15 @@ def overlay_floors_2d(
     max_width = max(bbox_widths)
     max_height = max(bbox_heights)
     padding = 50
-    ref_cx = (max_width + 2 * padding) / 2.0
-    ref_cy = (max_height + 2 * padding) / 2.0
+    # Pixel-perfect: referință și centre întregi
+    ref_cx = int(round((max_width + 2 * padding) / 2))
+    ref_cy = int(round((max_height + 2 * padding) / 2))
 
     draw_positions: List[Tuple[int, int]] = []
     for bbox in bboxes:
-        bbox_cx, bbox_cy = _bbox_center(bbox)
-        ox = int(round(ref_cx - bbox_cx))
-        oy = int(round(ref_cy - bbox_cy))
+        bbox_cx, bbox_cy = _bbox_center_int(bbox)
+        ox = ref_cx - bbox_cx
+        oy = ref_cy - bbox_cy
         draw_positions.append((ox, oy))
 
     min_ox = min(ox for ox, _ in draw_positions)
