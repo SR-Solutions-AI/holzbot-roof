@@ -3,42 +3,18 @@
     "segments": [
       {
         "segment_id": 1,
-        "length_px": 351.0,
+        "length_px": 1425.0,
         "p1": [
-          556.0,
-          1687.0
+          1097.0,
+          199.0
         ],
         "p2": [
-          907.0,
-          1687.0
-        ]
-      },
-      {
-        "segment_id": 2,
-        "length_px": 617.0,
-        "p1": [
-          1827.0,
-          1327.0
-        ],
-        "p2": [
-          1827.0,
-          710.0
-        ]
-      },
-      {
-        "segment_id": 3,
-        "length_px": 216.0,
-        "p1": [
-          1391.0,
-          710.0
-        ],
-        "p2": [
-          1391.0,
-          494.0
+          1097.0,
+          1624.0
         ]
       }
     ],
-    "total_length_px": 1184.0,
+    "total_length_px": 1425.0,
     "unitate": "pixeli (raportate la planul din care se face acoperișul)"
   },
   "burlane": {
@@ -48,77 +24,47 @@
         "length_px": 210.0,
         "length_3d_px": 210.0,
         "p1": [
-          -166.53,
-          857.74,
+          468.12,
+          699.78,
           0.0
         ],
         "p2": [
-          -166.53,
-          857.74,
-          210.0
-        ]
-      },
-      {
-        "burlan_id": 2,
-        "length_px": 210.0,
-        "length_3d_px": 210.0,
-        "p1": [
-          760.08,
-          490.19,
-          0.0
-        ],
-        "p2": [
-          760.08,
-          490.19,
+          468.12,
+          699.78,
           210.0
         ]
       }
     ],
-    "total_length_px": 420.0,
-    "count": 2,
+    "total_length_px": 210.0,
+    "count": 1,
     "unitate": "pixeli (lungime verticală)"
   },
   "conexiuni_streasure_burlane": {
     "segments": [
       {
         "conexiune_id": 1,
-        "length_px": 1111.28,
-        "length_2d_px": 1107.51,
+        "length_px": 820.4,
+        "length_2d_px": 815.23,
         "p1": [
-          -166.53,
-          857.74,
+          468.12,
+          699.78,
           210.0
         ],
         "p2": [
-          556.0,
-          1697.11,
-          301.36
-        ]
-      },
-      {
-        "conexiune_id": 2,
-        "length_px": 1103.02,
-        "length_2d_px": 1099.23,
-        "p1": [
-          760.08,
-          490.19,
-          210.0
-        ],
-        "p2": [
-          1837.11,
-          710.0,
-          301.36
+          1111.41,
+          199.0,
+          301.94
         ]
       }
     ],
-    "total_length_px": 2214.3,
-    "count": 2,
+    "total_length_px": 820.4,
+    "count": 1,
     "unitate": "pixeli (lungime 3D)"
   },
   "render_meta": {
-    "z_gutter": 301.36,
+    "z_gutter": 301.94,
     "roof_angle_deg": 30.0,
-    "overhang_px": 60.17102708114595,
+    "overhang_px": 85.77077007932249,
     "wall_height": 300.0
   }
 }

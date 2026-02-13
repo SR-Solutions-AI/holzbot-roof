@@ -6,15 +6,3 @@
 4 | sec0_piramida_4 | fata_4_sec0_piramida_4.png | fata_4_sec0_piramida_4_overlay.png
 5 | sec0_piramida_5 | fata_5_sec0_piramida_5.png | fata_5_sec0_piramida_5_overlay.png
 6 | sec0_piramida_6 | fata_6_sec0_piramida_6.png | fata_6_sec0_piramida_6_overlay.png
-7 | sec1_piramida_1 | fata_7_sec1_piramida_1.png | fata_7_sec1_piramida_1_overlay.png
-8 | sec1_piramida_2 | fata_8_sec1_piramida_2.png | fata_8_sec1_piramida_2_overlay.png
-9 | sec1_piramida_3 | fata_9_sec1_piramida_3.png | fata_9_sec1_piramida_3_overlay.png
-10 | sec1_piramida_4 | fata_10_sec1_piramida_4.png | fata_10_sec1_piramida_4_overlay.png
-11 | sec1_piramida_5 | fata_11_sec1_piramida_5.png | fata_11_sec1_piramida_5_overlay.png
-12 | sec1_piramida_6 | fata_12_sec1_piramida_6.png | fata_12_sec1_piramida_6_overlay.png
-13 | sec2_piramida_1 | fata_13_sec2_piramida_1.png | fata_13_sec2_piramida_1_overlay.png
-14 | sec2_piramida_2 | fata_14_sec2_piramida_2.png | fata_14_sec2_piramida_2_overlay.png
-15 | sec2_piramida_3 | fata_15_sec2_piramida_3.png | fata_15_sec2_piramida_3_overlay.png
-16 | sec2_piramida_4 | fata_16_sec2_piramida_4.png | fata_16_sec2_piramida_4_overlay.png
-17 | sec2_piramida_5 | fata_17_sec2_piramida_5.png | fata_17_sec2_piramida_5_overlay.png
-18 | sec2_piramida_6 | fata_18_sec2_piramida_6.png | fata_18_sec2_piramida_6_overlay.png

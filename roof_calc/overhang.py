@@ -549,6 +549,905 @@ def adjust_ridge_for_adjacent_floor(
     return {**roof_data, "sections": new_sections}
 
 
+def extend_secondary_sections_to_main_ridge(sections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Extinde ridge-urile secundare (perpendiculare pe ridge-ul principal) până ating
+    ridge-ul principal AL ETAJULUI RESPECTIV. Nu extinde către ridge-uri de la alte etaje.
+    Aceeași logică ca pentru a_lines.png - folosită și pentru 3D A-frame.
+    Returnează secțiuni noi cu ridge_line și bounding_rect extinse.
+    """
+    if len(sections) < 2:
+        return list(sections)
+
+    main_sec: Optional[Dict[str, Any]] = None
+    for sec in sections:
+        if sec.get("is_main"):
+            main_sec = sec
+            break
+    if main_sec is None:
+        def _area(s: Dict[str, Any]) -> float:
+            bb = rect_bounds_from_bounding_rect(s.get("bounding_rect") or [])
+            return float(bb.w * bb.h) if bb else 0.0
+        main_sec = max(sections, key=_area)
+
+    main_ridge = main_sec.get("ridge_line") or []
+    main_orient = str(main_sec.get("ridge_orientation", "horizontal"))
+    if len(main_ridge) < 2:
+        return list(sections)
+
+    mx0, my0 = _strip_xy(main_ridge[0])
+    mx1, my1 = _strip_xy(main_ridge[1])
+    main_is_horizontal = main_orient == "horizontal"
+    if main_is_horizontal:
+        main_y = (my0 + my1) / 2.0
+    else:
+        main_x = (mx0 + mx1) / 2.0
+
+    out: List[Dict[str, Any]] = []
+    for sec in sections:
+        if sec is main_sec:
+            out.append(dict(sec))
+            continue
+
+        orient = str(sec.get("ridge_orientation", "horizontal"))
+        ridge = sec.get("ridge_line") or []
+        if len(ridge) < 2 or orient == main_orient:
+            out.append(dict(sec))
+            continue
+
+        sx0, sy0 = _strip_xy(ridge[0])
+        sx1, sy1 = _strip_xy(ridge[1])
+        br = sec.get("bounding_rect") or []
+        new_rect = list(br)
+        minx_br = miny_br = maxx_br = maxy_br = 0.0
+        if len(br) >= 3:
+            xs_br = [float(p[0]) for p in br]
+            ys_br = [float(p[1]) for p in br]
+            minx_br, maxx_br = min(xs_br), max(xs_br)
+            miny_br, maxy_br = min(ys_br), max(ys_br)
+
+        if main_is_horizontal:
+            sx = (sx0 + sx1) / 2.0
+            sy_lo = min(min(sy0, sy1), main_y)
+            sy_hi = max(max(sy0, sy1), main_y)
+            new_ridge = [(sx, sy_lo), (sx, sy_hi)]
+            if len(br) >= 3:
+                miny_br = min(miny_br, main_y)
+                maxy_br = max(maxy_br, main_y)
+                new_rect = [(minx_br, miny_br), (maxx_br, miny_br), (maxx_br, maxy_br), (minx_br, maxy_br)]
+        else:
+            sy = (sy0 + sy1) / 2.0
+            sx_lo = min(min(sx0, sx1), main_x)
+            sx_hi = max(max(sx0, sx1), main_x)
+            new_ridge = [(sx_lo, sy), (sx_hi, sy)]
+            if len(br) >= 3:
+                minx_br = min(minx_br, main_x)
+                maxx_br = max(maxx_br, main_x)
+                new_rect = [(minx_br, miny_br), (maxx_br, miny_br), (maxx_br, maxy_br), (minx_br, maxy_br)]
+
+        out.append({**sec, "ridge_line": new_ridge, "bounding_rect": new_rect})
+    return out
+
+
+def extend_sections_to_connect(
+    sections: List[Dict[str, Any]],
+    connections: List[Dict[str, Any]],
+    *,
+    tol: float = 2.0,
+) -> List[Dict[str, Any]]:
+    """
+    Extinde secțiunile mai mici ca să se conecteze cu vecinii mai mari.
+    Pentru fiecare conexiune, secțiunea mai mică își extinde bounding_rect
+    până atinge limita vecinului.
+    """
+    if not sections or not connections:
+        return list(sections)
+    id_to_idx: Dict[int, int] = {}
+    for i, sec in enumerate(sections):
+        sid = sec.get("section_id")
+        if sid is not None:
+            id_to_idx[int(sid)] = i
+    areas: List[float] = []
+    for sec in sections:
+        bb = rect_bounds_from_bounding_rect(sec.get("bounding_rect") or [])
+        areas.append(float(bb.w * bb.h) if bb else 0.0)
+    out = [dict(s) for s in sections]
+    bounds: List[Optional[RectBounds]] = [
+        rect_bounds_from_bounding_rect(s.get("bounding_rect") or []) for s in sections
+    ]
+    for conn in connections:
+        ids = conn.get("section_ids") or conn.get("section_id")
+        if isinstance(ids, (list, tuple)) and len(ids) >= 2:
+            ia, ib = int(ids[0]), int(ids[1])
+        else:
+            continue
+        ia_idx = id_to_idx.get(ia)
+        ib_idx = id_to_idx.get(ib)
+        if ia_idx is None or ib_idx is None:
+            continue
+        ia, ib = ia_idx, ib_idx
+        ba, bb = bounds[ia], bounds[ib]
+        if ba is None or bb is None:
+            continue
+        area_a, area_b = areas[ia], areas[ib]
+        if area_a >= area_b:
+            continue
+        small_idx, large_idx = ia, ib
+        b_small, b_large = bounds[small_idx], bounds[large_idx]
+        if b_small is None or b_large is None:
+            continue
+        minx, maxx = b_small.minx, b_small.maxx
+        miny, maxy = b_small.miny, b_small.maxy
+        changed = False
+        overlap_y = min(b_small.maxy, b_large.maxy) - max(b_small.miny, b_large.miny)
+        overlap_x = min(b_small.maxx, b_large.maxx) - max(b_small.minx, b_large.minx)
+        if overlap_y > tol:
+            if b_small.maxx < b_large.minx - tol:
+                maxx = max(maxx, b_large.minx)
+                changed = True
+            if b_small.minx > b_large.maxx + tol:
+                minx = min(minx, b_large.maxx)
+                changed = True
+        if overlap_x > tol:
+            if b_small.maxy < b_large.miny - tol:
+                maxy = max(maxy, b_large.miny)
+                changed = True
+            if b_small.miny > b_large.maxy + tol:
+                miny = min(miny, b_large.maxy)
+                changed = True
+        if changed:
+            rect = [(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)]
+            out[small_idx]["bounding_rect"] = rect
+            ridge = out[small_idx].get("ridge_line") or []
+            orient = str(out[small_idx].get("ridge_orientation", "horizontal"))
+            if len(ridge) >= 2:
+                rx0, ry0 = _strip_xy(ridge[0])
+                rx1, ry1 = _strip_xy(ridge[1])
+                ridge_mid_x = (rx0 + rx1) / 2.0
+                ridge_mid_y = (ry0 + ry1) / 2.0
+            else:
+                ridge_mid_x = (minx + maxx) / 2.0
+                ridge_mid_y = (miny + maxy) / 2.0
+            if orient == "vertical":
+                new_ridge = [(ridge_mid_x, miny), (ridge_mid_x, maxy)]
+            else:
+                new_ridge = [(minx, ridge_mid_y), (maxx, ridge_mid_y)]
+            out[small_idx]["ridge_line"] = new_ridge
+            bounds[small_idx] = RectBounds(minx, miny, maxx, maxy)
+    return out
+
+
+def ridge_to_corner_lines_per_section(
+    sections: List[Dict[str, Any]],
+) -> List[Tuple[Tuple[float, float], List[Tuple[float, float]], Tuple[float, float, float, float]]]:
+    """
+    Pentru fiecare secțiune: linii mov de la capetele ridge-ului la colțurile DREPTUNGHIULUI respectiv.
+    Liniile nu ies din dreptunghi; fiecare dreptunghi folosește ridge-ul propriu.
+    Returnează [(punct_ridge, [colțuri], rect_key), ...].
+    """
+    out: List[Tuple[Tuple[float, float], List[Tuple[float, float]], Tuple[float, float, float, float]]] = []
+    for sec in sections:
+        br = sec.get("bounding_rect") or []
+        ridge = sec.get("ridge_line") or []
+        if len(br) < 3 or len(ridge) < 2:
+            continue
+        xs = [float(p[0]) for p in br]
+        ys = [float(p[1]) for p in br]
+        rminx, rmaxx = min(xs), max(xs)
+        rminy, rmaxy = min(ys), max(ys)
+        rect_key = (round(rminx, 2), round(rminy, 2), round(rmaxx, 2), round(rmaxy, 2))
+        corners = [(rminx, rminy), (rmaxx, rminy), (rmaxx, rmaxy), (rminx, rmaxy)]
+        orient = str(sec.get("ridge_orientation", "horizontal"))
+        r0 = (float(ridge[0][0]), float(ridge[0][1]))
+        r1 = (float(ridge[1][0]), float(ridge[1][1]))
+        _tol = 1e-3
+        if orient == "horizontal":
+            left_pt = r0 if r0[0] < r1[0] else r1
+            right_pt = r1 if r0[0] < r1[0] else r0
+            left_corners = [c for c in corners if abs(c[0] - rminx) <= _tol]
+            right_corners = [c for c in corners if abs(c[0] - rmaxx) <= _tol]
+            if left_corners:
+                out.append((left_pt, left_corners, rect_key))
+            if right_corners:
+                out.append((right_pt, right_corners, rect_key))
+        else:
+            top_pt = r0 if r0[1] < r1[1] else r1
+            bottom_pt = r1 if r0[1] < r1[1] else r0
+            top_corners = [c for c in corners if abs(c[1] - rminy) <= _tol]
+            bottom_corners = [c for c in corners if abs(c[1] - rmaxy) <= _tol]
+            if top_corners:
+                out.append((top_pt, top_corners, rect_key))
+            if bottom_corners:
+                out.append((bottom_pt, bottom_corners, rect_key))
+    return out
+
+
+def ridge_intersection_corner_lines(
+    sections: List[Dict[str, Any]],
+    *,
+    floor_polygon: Optional[Any] = None,
+    per_section: bool = False,
+) -> List[Tuple[Tuple[float, float], List[Tuple[float, float]], Tuple[float, float, float, float]]]:
+    """
+    Pentru fiecare intersecție ridge principal–secundar returnează (punct, colțuri, rect_key).
+    Când per_section=True: fiecare dreptunghi folosește ridge-ul propriu, linii mov doar în interiorul rect.
+    """
+    if per_section:
+        return ridge_to_corner_lines_per_section(sections)
+    extended = extend_secondary_sections_to_main_ridge(sections)
+    if len(extended) < 1:
+        return []
+    seen_corner: set = set()
+    all_exterior_corners: List[Tuple[float, float]] = []
+    for sec in extended:
+        br = sec.get("bounding_rect") or []
+        if len(br) < 3:
+            continue
+        xs = [float(p[0]) for p in br]
+        ys = [float(p[1]) for p in br]
+        corners_sec = [
+            (min(xs), min(ys)), (max(xs), min(ys)),
+            (max(xs), max(ys)), (min(xs), max(ys)),
+        ]
+        for c in corners_sec:
+            key = (round(c[0], 4), round(c[1], 4))
+            if key not in seen_corner:
+                seen_corner.add(key)
+                all_exterior_corners.append(c)
+    try:
+        from shapely.geometry import Polygon as ShapelyPolygon
+        from shapely.ops import unary_union
+        polys = []
+        for sec in extended:
+            br = sec.get("bounding_rect") or []
+            if len(br) < 3:
+                continue
+            polys.append(ShapelyPolygon([(float(p[0]), float(p[1])) for p in br]))
+        if polys:
+            union_poly = unary_union(polys)
+            if union_poly and not getattr(union_poly, "is_empty", True):
+                for ext in ([getattr(union_poly, "exterior", None)] + list(getattr(union_poly, "interiors", []))):
+                    if ext is not None:
+                        coords = list(getattr(ext, "coords", []))
+                        for i in range(len(coords) - 1):
+                            c = (float(coords[i][0]), float(coords[i][1]))
+                            key = (round(c[0], 4), round(c[1], 4))
+                            if key not in seen_corner:
+                                seen_corner.add(key)
+                                all_exterior_corners.append(c)
+    except Exception:
+        pass
+    # Include floor polygon vertices – conturul real al casei (poate avea colțuri în plus față de secțiuni)
+    if floor_polygon is not None and hasattr(floor_polygon, "exterior"):
+        try:
+            coords_ex = list(getattr(floor_polygon.exterior, "coords", []))
+            for i in range(len(coords_ex) - 1):
+                c = (float(coords_ex[i][0]), float(coords_ex[i][1]))
+                key = (round(c[0], 4), round(c[1], 4))
+                if key not in seen_corner:
+                    seen_corner.add(key)
+                    all_exterior_corners.append(c)
+        except Exception:
+            pass
+    if not all_exterior_corners:
+        return []
+
+    main_sec = next((s for s in extended if s.get("is_main")), None)
+    if main_sec is None:
+        def _ar(s: Dict[str, Any]) -> float:
+            bb = rect_bounds_from_bounding_rect(s.get("bounding_rect") or [])
+            return float(bb.w * bb.h) if bb else 0.0
+        main_sec = max(extended, key=_ar)
+    main_ridge = main_sec.get("ridge_line") or []
+    main_orient = str(main_sec.get("ridge_orientation", "horizontal"))
+    if len(main_ridge) < 2:
+        return []
+    main_br = main_sec.get("bounding_rect") or []
+    if len(main_br) < 3:
+        return []
+    main_xs = [float(p[0]) for p in main_br]
+    main_ys = [float(p[1]) for p in main_br]
+    all_minx = min(main_xs)
+    all_maxx = max(main_xs)
+    all_miny = min(main_ys)
+    all_maxy = max(main_ys)
+    for sec in extended:
+        br = sec.get("bounding_rect") or []
+        if len(br) < 3:
+            continue
+        for p in br:
+            all_minx = min(all_minx, float(p[0]))
+            all_maxx = max(all_maxx, float(p[0]))
+            all_miny = min(all_miny, float(p[1]))
+            all_maxy = max(all_maxy, float(p[1]))
+    main_y = (float(main_ridge[0][1]) + float(main_ridge[1][1])) / 2.0
+    main_x = (float(main_ridge[0][0]) + float(main_ridge[1][0])) / 2.0
+    ma = (all_minx, main_y) if main_orient == "horizontal" else (main_x, all_miny)
+    mb = (all_maxx, main_y) if main_orient == "horizontal" else (main_x, all_maxy)
+
+    intersections: List[Tuple[float, float]] = []
+    pt_to_rect_keys: Dict[Tuple[float, float], List[Tuple[float, float, float, float]]] = {}
+    pt_wedge_side: Dict[Tuple[float, float], str] = {}
+    _tol = 1e-3
+
+    def _round_pt(p: Tuple[float, float]) -> Tuple[float, float]:
+        return (round(p[0], 4), round(p[1], 4))
+
+    for idx, sec in enumerate(extended):
+        br = sec.get("bounding_rect") or []
+        if len(br) < 3:
+            continue
+        xs = [float(p[0]) for p in br]
+        ys = [float(p[1]) for p in br]
+        rect_key = (round(min(xs), 2), round(min(ys), 2), round(max(xs), 2), round(max(ys), 2))
+        sec_cy = (min(ys) + max(ys)) / 2.0
+        sec_cx = (min(xs) + max(xs)) / 2.0
+        if sec is main_sec:
+            continue
+        if str(sec.get("ridge_orientation", "horizontal")) == main_orient:
+            continue
+        ridge = sec.get("ridge_line") or []
+        if len(ridge) < 2:
+            continue
+        sa = (float(ridge[0][0]), float(ridge[0][1]))
+        sb = (float(ridge[1][0]), float(ridge[1][1]))
+        pt = _segment_intersect(ma, mb, sa, sb)
+        if pt is None:
+            continue
+        pk = _round_pt(pt)
+        wedge = "below" if (main_orient == "horizontal" and sec_cy > main_y) or (main_orient == "vertical" and sec_cx > main_x) else "above"
+        if pk not in pt_to_rect_keys:
+            intersections.append(pt)
+            pt_to_rect_keys[pk] = []
+            pt_wedge_side[pk] = wedge
+        sec_rect = (round(min(xs), 2), round(min(ys), 2), round(max(xs), 2), round(max(ys), 2))
+        if sec_rect not in pt_to_rect_keys[pk]:
+            pt_to_rect_keys[pk].append(sec_rect)
+        # NU adăugăm main_rect (dreptunghiul întregii clădiri) – altfel liniile mov
+        # ar merge la colțuri din zone îndepărtate (altă secțiune). Doar sec_rect.
+
+    if not intersections:
+        main_rect_key = (round(all_minx, 2), round(all_miny, 2), round(all_maxx, 2), round(all_maxy, 2))
+        return [((main_x, main_y), list(all_exterior_corners), main_rect_key)]
+
+    _wedge_tol = 1e-6
+    _ridge_on_tol = 0.5
+
+    def _corner_on_main_ridge(c: Tuple[float, float]) -> bool:
+        """Colț pe ridge-ul principal – nu desenăm linii mov către el (evită linia orizontală lungă)."""
+        if main_orient == "horizontal":
+            return abs(c[1] - main_y) <= _ridge_on_tol
+        return abs(c[0] - main_x) <= _ridge_on_tol
+
+    all_exterior_corners = [c for c in all_exterior_corners if not _corner_on_main_ridge(c)]
+    if not all_exterior_corners:
+        return []
+
+    if main_orient == "horizontal":
+        sorted_ix = sorted(range(len(intersections)), key=lambda j: intersections[j][0])
+    else:
+        sorted_ix = sorted(range(len(intersections)), key=lambda j: intersections[j][1])
+    sorted_intersections = [intersections[j] for j in sorted_ix]
+    n_int = len(sorted_intersections)
+
+    def _strip_for_inter(idx: int) -> Tuple[float, float]:
+        if main_orient == "horizontal":
+            x = sorted_intersections[idx][0]
+            if idx == 0:
+                return (float("-inf"), (x + sorted_intersections[1][0]) / 2.0) if n_int > 1 else (float("-inf"), float("inf"))
+            if idx == n_int - 1:
+                return ((sorted_intersections[idx - 1][0] + x) / 2.0, float("inf")) if n_int > 1 else (float("-inf"), float("inf"))
+            return ((sorted_intersections[idx - 1][0] + x) / 2.0, (x + sorted_intersections[idx + 1][0]) / 2.0)
+        else:
+            y = sorted_intersections[idx][1]
+            if idx == 0:
+                return (float("-inf"), (y + sorted_intersections[1][1]) / 2.0) if n_int > 1 else (float("-inf"), float("inf"))
+            if idx == n_int - 1:
+                return ((sorted_intersections[idx - 1][1] + y) / 2.0, float("inf")) if n_int > 1 else (float("-inf"), float("inf"))
+            return ((sorted_intersections[idx - 1][1] + y) / 2.0, (y + sorted_intersections[idx + 1][1]) / 2.0)
+
+    def _corner_in_wedge_at(corner: Tuple[float, float], inter: Tuple[float, float], wedge_side: str) -> bool:
+        """Linia mov trebuie să fie în unghiul de 90° ales: pe aceeași parte a ridge-ului principal ca secțiunea secundară."""
+        dx = corner[0] - inter[0]
+        dy = corner[1] - inter[1]
+        if abs(dx) <= _wedge_tol or abs(dy) <= _wedge_tol:
+            return False
+        if main_orient == "horizontal":
+            if wedge_side == "below":
+                return dy > 0
+            return dy < 0
+        else:
+            if wedge_side == "below":
+                return dx > 0
+            return dx < 0
+
+    def _dist_sq(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+        return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
+
+    corners_assigned: Dict[int, int] = {}
+    for ci, c in enumerate(all_exterior_corners):
+        best_j: Optional[int] = None
+        best_d = float("inf")
+        # Prioritate 1: colțul merge la ridge-ul din secțiunea care îl conține (sec_rect)
+        for j, pt in enumerate(intersections):
+            rect_keys = pt_to_rect_keys.get(_round_pt(pt), [])
+            for rk in rect_keys:
+                rminx, rminy, rmaxx, rmaxy = rk
+                if rminx - _tol <= c[0] <= rmaxx + _tol and rminy - _tol <= c[1] <= rmaxy + _tol:
+                    d = _dist_sq(c, pt)
+                    if d < best_d:
+                        best_d = d
+                        best_j = j
+                    break
+        # Prioritate 2 (fallback): strip + wedge dacă colțul e în afara tuturor sec_rect
+        if best_j is None:
+            if main_orient == "horizontal":
+                coord = c[0]
+            else:
+                coord = c[1]
+            for idx in range(n_int):
+                j = sorted_ix[idx]
+                pt = intersections[j]
+                lo, hi = _strip_for_inter(idx)
+                wedge_side = pt_wedge_side.get(_round_pt(pt), "below")
+                if lo <= coord <= hi and _corner_in_wedge_at(c, pt, wedge_side):
+                    d = _dist_sq(c, pt)
+                    if d < best_d:
+                        best_d = d
+                        best_j = j
+            if best_j is None:
+                for j, pt in enumerate(intersections):
+                    wedge_side = pt_wedge_side.get(_round_pt(pt), "below")
+                    if _corner_in_wedge_at(c, pt, wedge_side):
+                        d = _dist_sq(c, pt)
+                        if d < best_d:
+                            best_d = d
+                            best_j = j
+        if best_j is None:
+            best_j = 0
+        corners_assigned[ci] = best_j
+
+    corners_by_int: Dict[int, List[Tuple[float, float]]] = {j: [] for j in range(len(intersections))}
+    for ci, j in corners_assigned.items():
+        corners_by_int[j].append(all_exterior_corners[ci])
+
+    out: List[Tuple[Tuple[float, float], List[Tuple[float, float]], Tuple[float, float, float, float]]] = []
+    used_corners: set = set()
+    _ck = lambda c: (round(c[0], 4), round(c[1], 4))
+
+    for j, pt in enumerate(intersections):
+        corners_j = list(corners_by_int.get(j, []))
+        if not corners_j:
+            continue
+        rect_keys = pt_to_rect_keys.get(_round_pt(pt), [])
+        placed_this_int: set = set()
+        for rk in rect_keys:
+            rminx, rminy, rmaxx, rmaxy = rk
+            assigned: List[Tuple[float, float]] = []
+            for c in corners_j:
+                ck = _ck(c)
+                if ck in used_corners or ck in placed_this_int:
+                    continue
+                if rminx - _tol <= c[0] <= rmaxx + _tol and rminy - _tol <= c[1] <= rmaxy + _tol:
+                    assigned.append(c)
+                    used_corners.add(ck)
+                    placed_this_int.add(ck)
+            if assigned:
+                out.append((pt, assigned, rk))
+        remaining = [c for c in corners_j if _ck(c) not in used_corners]
+        if remaining and rect_keys:
+            for c in remaining:
+                used_corners.add(_ck(c))
+            out.append((pt, remaining, rect_keys[0]))
+
+    return out
+
+
+def get_ridge_segments_for_a_faces(
+    sections: List[Dict[str, Any]],
+    z_ridge: float,
+) -> List[Tuple[List[float], List[float]]]:
+    """
+    Ridge-uri pentru a_faces: același calcul ca ridge_intersection_corner_lines.
+    Returnează segmente [(p1,p2), ...] cu p1,p2 = [x,y,z].
+    Includ: ridge principal (ma-mb) subdivizat la intersecții + ridge-uri secundare extinse.
+    """
+    extended = extend_secondary_sections_to_main_ridge(sections)
+    if len(extended) < 1:
+        return []
+
+    main_sec = next((s for s in extended if s.get("is_main")), None)
+    if main_sec is None:
+        def _ar(s: Dict[str, Any]) -> float:
+            bb = rect_bounds_from_bounding_rect(s.get("bounding_rect") or [])
+            return float(bb.w * bb.h) if bb else 0.0
+        main_sec = max(extended, key=_ar)
+
+    main_ridge = main_sec.get("ridge_line") or []
+    main_orient = str(main_sec.get("ridge_orientation", "horizontal"))
+    if len(main_ridge) < 2:
+        return []
+
+    main_br = main_sec.get("bounding_rect") or []
+    if len(main_br) < 3:
+        return []
+    main_xs = [float(p[0]) for p in main_br]
+    main_ys = [float(p[1]) for p in main_br]
+    all_minx, all_maxx = min(main_xs), max(main_xs)
+    all_miny, all_maxy = min(main_ys), max(main_ys)
+    for sec in extended:
+        br = sec.get("bounding_rect") or []
+        if len(br) >= 3:
+            for p in br:
+                all_minx = min(all_minx, float(p[0]))
+                all_maxx = max(all_maxx, float(p[0]))
+                all_miny = min(all_miny, float(p[1]))
+                all_maxy = max(all_maxy, float(p[1]))
+
+    main_y = (float(main_ridge[0][1]) + float(main_ridge[1][1])) / 2.0
+    main_x = (float(main_ridge[0][0]) + float(main_ridge[1][0])) / 2.0
+    ma = (all_minx, main_y) if main_orient == "horizontal" else (main_x, all_miny)
+    mb = (all_maxx, main_y) if main_orient == "horizontal" else (main_x, all_maxy)
+
+    segments: List[Tuple[List[float], List[float]]] = []
+
+    # Intersecții ridge principal cu ridge-uri secundare
+    intersections: List[Tuple[float, float]] = []
+    for sec in extended:
+        if sec is main_sec:
+            continue
+        if str(sec.get("ridge_orientation", "horizontal")) == main_orient:
+            continue
+        ridge = sec.get("ridge_line") or []
+        if len(ridge) < 2:
+            continue
+        sa = (float(ridge[0][0]), float(ridge[0][1]))
+        sb = (float(ridge[1][0]), float(ridge[1][1]))
+        pt = _segment_intersect(ma, mb, sa, sb)
+        if pt is None:
+            continue
+        pk = (round(pt[0], 4), round(pt[1], 4))
+        if pk not in [(round(i[0], 4), round(i[1], 4)) for i in intersections]:
+            intersections.append(pt)
+
+    # Ridge principal: ma-mb, subdivizat la intersecții
+    if main_orient == "horizontal":
+        cuts = sorted([ma[0], mb[0]] + [i[0] for i in intersections])
+    else:
+        cuts = sorted([ma[1], mb[1]] + [i[1] for i in intersections])
+    cuts = [c for i, c in enumerate(cuts) if i == 0 or cuts[i] != cuts[i - 1]]
+    for k in range(len(cuts) - 1):
+        if main_orient == "horizontal":
+            p1 = [cuts[k], main_y, z_ridge]
+            p2 = [cuts[k + 1], main_y, z_ridge]
+        else:
+            p1 = [main_x, cuts[k], z_ridge]
+            p2 = [main_x, cuts[k + 1], z_ridge]
+        segments.append((p1, p2))
+
+    # Ridge-uri secundare: TOATE (perpendiculare ȘI paralele cu principalul)
+    # Extinderea se face doar pentru perpendiculare, dar și cele paralele trebuie incluse
+    for sec in extended:
+        if sec is main_sec:
+            continue
+        ridge = sec.get("ridge_line") or []
+        if len(ridge) >= 2:
+            r0 = [float(ridge[0][0]), float(ridge[0][1]), z_ridge]
+            r1 = [float(ridge[1][0]), float(ridge[1][1]), z_ridge]
+            segments.append((r0, r1))
+
+    return segments
+
+
+def get_faces_3d_aframe_with_magenta(
+    sections: List[Dict[str, Any]],
+    connections: List[Dict[str, Any]],
+    *,
+    roof_angle_deg: float,
+    wall_height: float,
+    corner_lines: Optional[List[Tuple[Tuple[float, float], List[Tuple[float, float]]]]] = None,
+    floor_polygon: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Fețe 3D pentru A-frame. Păstrează structura de acoperiș (ridge + streașină).
+    Dacă există linii mov (de la intersecție la colțuri), fiecare față ridge–streașină
+    se împarte în două (sau mai multe) fețe, nu se înlocuiește cu piramidă.
+    """
+    import math
+    import roof_calc.roof_faces_3d as rf
+
+    if not corner_lines:
+        return rf.get_faces_3d_standard(sections, connections, roof_angle_deg=roof_angle_deg, wall_height=wall_height)
+
+    magenta_keys: set = set()
+    pt_corners_by_key: Dict[Tuple, List[Tuple[Tuple[float, float], List[Tuple[float, float]]]]] = {}
+    for item in corner_lines:
+        if len(item) == 3:
+            pt, corners, rect_key = item
+        else:
+            pt, corners = item
+            rect_key = (round(min(c[0] for c in corners), 2), round(min(c[1] for c in corners), 2),
+                        round(max(c[0] for c in corners), 2), round(max(c[1] for c in corners), 2)) if corners else None
+        if rect_key is None or len(corners) < 1:
+            continue
+        magenta_keys.add(rect_key)
+        if rect_key not in pt_corners_by_key:
+            pt_corners_by_key[rect_key] = []
+        pt_corners_by_key[rect_key].append((pt, corners))
+
+    all_faces: List[Dict[str, Any]] = []
+    tan_angle = math.tan(math.radians(roof_angle_deg))
+
+    def _snap_to_boundary(cx: float, cy: float) -> Tuple[float, float]:
+        """Snap (cx,cy) la cel mai apropiat punct pe conturul streașinii."""
+        if floor_polygon is None or not hasattr(floor_polygon, "exterior"):
+            return (cx, cy)
+        coords = list(getattr(floor_polygon.exterior, "coords", []))
+        if len(coords) < 2:
+            return (cx, cy)
+        corner_tol, boundary_tol = 2.0, 2.5
+        for i in range(len(coords) - 1):
+            vx, vy = float(coords[i][0]), float(coords[i][1])
+            if (cx - vx) ** 2 + (cy - vy) ** 2 <= corner_tol * corner_tol:
+                return (vx, vy)
+        best_pt, best_d2 = (cx, cy), float("inf")
+        for i in range(len(coords) - 1):
+            x1, y1 = float(coords[i][0]), float(coords[i][1])
+            x2, y2 = float(coords[i + 1][0]), float(coords[i + 1][1])
+            dx, dy = x2 - x1, y2 - y1
+            L2 = dx * dx + dy * dy
+            t = max(0, min(1, ((cx - x1) * dx + (cy - y1) * dy) / L2)) if L2 > 1e-12 else 0
+            nx, ny = x1 + t * dx, y1 + t * dy
+            d2 = (cx - nx) ** 2 + (cy - ny) ** 2
+            if d2 < best_d2:
+                best_d2, best_pt = d2, (nx, ny)
+        return best_pt if best_d2 <= boundary_tol * boundary_tol else (cx, cy)
+
+    interior_keys: set = set()
+    if floor_polygon is not None and hasattr(floor_polygon, "exterior"):
+        coords_ex = list(getattr(floor_polygon.exterior, "coords", []))
+        for i in range(len(coords_ex)):
+            curr = (float(coords_ex[i][0]), float(coords_ex[i][1]))
+            prev = (float(coords_ex[i - 1][0]), float(coords_ex[i - 1][1])) if i > 0 else (float(coords_ex[-2][0]), float(coords_ex[-2][1]))
+            next_p = (float(coords_ex[i + 1][0]), float(coords_ex[i + 1][1])) if i + 1 < len(coords_ex) else (float(coords_ex[1][0]), float(coords_ex[1][1]))
+            if _is_interior_corner(prev, curr, next_p, floor_polygon):
+                interior_keys.add((round(curr[0], 1), round(curr[1], 1)))
+
+    def _is_interior(cx: float, cy: float) -> bool:
+        return (round(cx, 1), round(cy, 1)) in interior_keys
+
+    def _drop_interior_and_symmetric(corners_2d: list) -> set:
+        """Indicii colțurilor de eliminat (interior + simetric opus)."""
+        drop = {i for i, c in enumerate(corners_2d) if _is_interior(*_snap_to_boundary(float(c[0]), float(c[1])))}
+        n = len(corners_2d)
+        for i in list(drop):
+            drop.add(n - 1 - i)
+        return drop
+
+    for sec in sections:
+        br = sec.get("bounding_rect") or []
+        if len(br) < 3:
+            continue
+        xs = [float(p[0]) for p in br]
+        ys = [float(p[1]) for p in br]
+        minx, maxx = min(xs), max(xs)
+        miny, maxy = min(ys), max(ys)
+        key = (round(minx, 2), round(miny, 2), round(maxx, 2), round(maxy, 2))
+        base_z = wall_height
+
+        if key in magenta_keys:
+            entries = pt_corners_by_key[key]
+            all_corners_sec: List[Tuple[float, float]] = []
+            primary_pt = entries[0][0]
+            for pt, corners in entries:
+                all_corners_sec.extend(corners)
+                if minx <= pt[0] <= maxx and miny <= pt[1] <= maxy:
+                    primary_pt = pt
+            pt = primary_pt
+            corners = all_corners_sec
+            ix, iy = float(pt[0]), float(pt[1])
+            orient = sec.get("ridge_orientation", "horizontal")
+            rl = sec.get("ridge_line") or []
+            if len(rl) >= 2:
+                ridge_mid_x = (float(rl[0][0]) + float(rl[1][0])) / 2.0
+                ridge_mid_y = (float(rl[0][1]) + float(rl[1][1])) / 2.0
+            else:
+                ridge_mid_x = (minx + maxx) / 2.0
+                ridge_mid_y = (miny + maxy) / 2.0
+            span = (maxy - miny) / 2.0 if orient == "horizontal" else (maxx - minx) / 2.0
+            ridge_height = base_z + span * tan_angle
+            int_3d = [ix, iy, ridge_height]
+            tx, ty = _snap_to_boundary(minx, maxy)
+            tl = [tx, ty, base_z]
+            tx, ty = _snap_to_boundary(maxx, maxy)
+            tr = [tx, ty, base_z]
+            tx, ty = _snap_to_boundary(maxx, miny)
+            br_pt = [tx, ty, base_z]
+            tx, ty = _snap_to_boundary(minx, miny)
+            bl = [tx, ty, base_z]
+            left_r = [minx, ridge_mid_y, ridge_height]
+            right_r = [maxx, ridge_mid_y, ridge_height]
+            top_r = [ridge_mid_x, miny, ridge_height]
+            bottom_r = [ridge_mid_x, maxy, ridge_height]
+            _tol = 1e-4
+            def _has(c: Tuple[float, float]) -> bool:
+                return any(abs(c[0] - x) <= _tol and abs(c[1] - y) <= _tol for x, y in corners)
+            has_tl = _has((minx, maxy))
+            has_tr = _has((maxx, maxy))
+            has_bl = _has((minx, miny))
+            has_br = _has((maxx, miny))
+
+            drop_left = _drop_interior_and_symmetric([(tl[0], tl[1]), (bl[0], bl[1])])
+            drop_right = _drop_interior_and_symmetric([(tr[0], tr[1]), (br_pt[0], br_pt[1])])
+            keep_tl, keep_bl = 0 not in drop_left, 1 not in drop_left
+            keep_tr, keep_br = 0 not in drop_right, 1 not in drop_right
+
+            def add_face(verts: List[List[float]]) -> None:
+                all_faces.append({"vertices_3d": verts})
+
+            if orient == "horizontal":
+                if has_tl and has_tr:
+                    if keep_tl:
+                        add_face([list(tl), int_3d, left_r])
+                    if keep_tr:
+                        add_face([list(tr), right_r, int_3d])
+                    if keep_tl and keep_tr:
+                        add_face([list(tl), list(tr), int_3d])
+                else:
+                    if keep_tl and keep_tr:
+                        add_face([list(tl), list(tr), right_r, left_r])
+                if has_bl and has_br:
+                    if keep_bl:
+                        add_face([list(bl), left_r, int_3d])
+                    if keep_br:
+                        add_face([list(br_pt), int_3d, right_r])
+                    if keep_bl and keep_br:
+                        add_face([list(bl), int_3d, list(br_pt)])
+                else:
+                    if keep_bl and keep_br:
+                        add_face([left_r, right_r, list(br_pt), list(bl)])
+            else:
+                drop_top = _drop_interior_and_symmetric([(tl[0], tl[1]), (tr[0], tr[1])])
+                drop_bottom = _drop_interior_and_symmetric([(bl[0], bl[1]), (br_pt[0], br_pt[1])])
+                keep_tl_v, keep_tr_v = 0 not in drop_top, 1 not in drop_top
+                keep_bl_v, keep_br_v = 0 not in drop_bottom, 1 not in drop_bottom
+                if has_tl and has_bl:
+                    if keep_tl_v:
+                        add_face([list(tl), int_3d, top_r])
+                    if keep_bl_v:
+                        add_face([list(bl), bottom_r, int_3d])
+                    if keep_tl_v and keep_bl_v:
+                        add_face([list(tl), list(bl), int_3d])
+                else:
+                    if keep_tl_v and keep_bl_v:
+                        add_face([list(bl), list(tl), bottom_r, top_r])
+                if has_tr and has_br:
+                    if keep_tr_v:
+                        add_face([list(tr), top_r, int_3d])
+                    if keep_br_v:
+                        add_face([list(br_pt), int_3d, bottom_r])
+                    if keep_tr_v and keep_br_v:
+                        add_face([list(tr), int_3d, list(br_pt)])
+                else:
+                    if keep_tr_v and keep_br_v:
+                        add_face([top_r, bottom_r, list(br_pt), list(tr)])
+        else:
+            pass
+
+    secs_standard = [s for s in sections if _section_key(s) not in magenta_keys]
+    if secs_standard:
+        std_faces = rf.get_faces_3d_standard(
+            secs_standard, connections, roof_angle_deg=roof_angle_deg, wall_height=wall_height
+        )
+        all_faces.extend(std_faces)
+
+    return all_faces
+
+
+def _section_key(sec: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+    br = sec.get("bounding_rect") or []
+    if len(br) < 3:
+        return None
+    xs = [float(p[0]) for p in br]
+    ys = [float(p[1]) for p in br]
+    return (round(min(xs), 2), round(min(ys), 2), round(max(xs), 2), round(max(ys), 2))
+
+
+def _make_valid_if_needed(geom: Any) -> Any:
+    """Încearcă make_valid pe geometrie invalidă; returnează originalul la eșec."""
+    if geom is None or getattr(geom, "is_valid", True):
+        return geom
+    try:
+        from shapely import make_valid
+
+        repaired = make_valid(geom)
+        return repaired if repaired is not None and not getattr(repaired, "is_empty", True) else geom
+    except Exception:
+        return geom
+
+
+def clip_roof_faces_to_polygon(
+    roof_faces: List[Dict[str, Any]],
+    boundary_polygon: Any,
+) -> List[Dict[str, Any]]:
+    """
+    Clipează fețele de acoperiș la poligonul de contur exterior.
+    Nicio față nu se extinde dincolo de marginile casei.
+    """
+    if not roof_faces or boundary_polygon is None:
+        return list(roof_faces)
+    try:
+        from shapely.geometry import Polygon as ShapelyPolygon
+    except Exception:
+        return list(roof_faces)
+    if hasattr(boundary_polygon, "exterior"):
+        clip_poly = boundary_polygon
+    else:
+        try:
+            coords = list(boundary_polygon) if hasattr(boundary_polygon, "__iter__") else []
+            if len(coords) < 3:
+                return list(roof_faces)
+            clip_poly = ShapelyPolygon(coords)
+        except Exception:
+            return list(roof_faces)
+    if clip_poly.is_empty:
+        return list(roof_faces)
+    clip_poly = _make_valid_if_needed(clip_poly)
+    if getattr(clip_poly, "is_empty", True):
+        return list(roof_faces)
+
+    out: List[Dict[str, Any]] = []
+    for f in roof_faces:
+        vs = f.get("vertices_3d") or []
+        if len(vs) < 3:
+            continue
+        pts_2d = [(float(v[0]), float(v[1])) for v in vs]
+        try:
+            face_poly = ShapelyPolygon(pts_2d)
+        except Exception:
+            out.append(f)
+            continue
+        if face_poly.is_empty:
+            continue
+        face_poly = _make_valid_if_needed(face_poly)
+        if getattr(face_poly, "is_empty", True):
+            continue
+        try:
+            inter = clip_poly.intersection(face_poly)
+        except Exception:
+            out.append(f)
+            continue
+        if inter.is_empty:
+            continue
+        polys_to_add = [inter] if hasattr(inter, "exterior") else list(inter.geoms) if hasattr(inter, "geoms") else []
+        for p in polys_to_add:
+            if p is None or getattr(p, "is_empty", True):
+                continue
+            ext = getattr(p, "exterior", None)
+            if ext is None:
+                continue
+            coords_2d = list(getattr(ext, "coords", []))[: -1] if ext else []
+            if len(coords_2d) < 3:
+                continue
+            v0, v1, v2 = vs[0], vs[1], vs[2]
+            x0, y0, z0 = float(v0[0]), float(v0[1]), float(v0[2])
+            x1, y1, z1 = float(v1[0]), float(v1[1]), float(v1[2])
+            x2, y2, z2 = float(v2[0]), float(v2[1]), float(v2[2])
+            denom = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+            if abs(denom) < 1e-12:
+                dz_dx, dz_dy = 0.0, 0.0
+            else:
+                dz_dx = ((z1 - z0) * (y2 - y0) - (z2 - z0) * (y1 - y0)) / denom
+                dz_dy = ((x1 - x0) * (z2 - z0) - (x2 - x0) * (z1 - z0)) / denom
+
+            def z_at(x: float, y: float) -> float:
+                return z0 + dz_dx * (x - x0) + dz_dy * (y - y0)
+
+            verts_3d = [[float(x), float(y), z_at(float(x), float(y))] for x, y in coords_2d]
+            out.append({"vertices_3d": verts_3d})
+    return out
+
+
 def apply_overhang_to_sections(
     sections: List[Dict[str, Any]],
     *,

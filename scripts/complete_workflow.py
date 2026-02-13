@@ -31,6 +31,7 @@ from roof_calc.visualize import (
     visualize_individual_rectangles,
     visualize_pyramid_lines,
     visualize_a_frame_lines,
+    visualize_a_frame_faces,
     _ordered_floor_polygons,
     _get_largest_rect_bbox,
 )
@@ -39,11 +40,14 @@ from roof_calc.visualize_3d_matplotlib import (
     visualize_3d_standard_matplotlib,
     visualize_3d_pyramid_matplotlib,
     visualize_3d_shed_matplotlib,
+    visualize_3d_a_frame_matplotlib,
 )
 from roof_calc.visualize_3d_plotly import (
     visualize_3d_standard_plotly,
     visualize_3d_pyramid_plotly,
     visualize_3d_shed_plotly,
+    visualize_3d_house_render_plotly,
+    visualize_3d_a_frame_plotly,
 )
 from roof_calc.overhang import (
     compute_overhang_px_from_roof_results,
@@ -67,6 +71,10 @@ from roof_calc.masks import (
     save_roof_overview_numbered,
 )
 from roof_calc.roof_unfold import generate_roof_unfolded_all_types
+from roof_calc.roof_types_workflow import (
+    remove_overlapping_rectangles,
+    generate_roof_type_outputs,
+)
 
 from shapely.ops import unary_union
 from shapely import affinity as shapely_affinity
@@ -312,18 +320,22 @@ def _generate_roof_outputs(
     visualize_rectangles(wall_mask_path, roof_result, output_path=str(out_dir / "rectangles.png"))
     visualize_roof_lines(wall_mask_path, roof_result, output_path=str(out_dir / "roof_lines.png"))
 
-    # Pentru pyramid_lines și a_lines: etaj ne‑top -> doar acoperișul vizibil (remaining)
-    rr_lines = roof_result_for_2d_lines if roof_result_for_2d_lines is not None else roof_result
-    mask_lines = wall_mask_path_for_2d_lines if wall_mask_path_for_2d_lines else wall_mask_path
+    # Pentru a_lines/a_faces/pyramid/shed: nu decupăm dreptunghiul, afișăm celelalte dreptunghiuri.
+    # Folosim întotdeauna roof_result (full) și masca parterului; excludem secțiunile care
+    # apar și la etaj (nu remaining roof / remaining mask care face decupare geometrică).
+    rr_lines = roof_result
+    mask_lines = wall_mask_path
+    upper_for_filter = upper_floor_roof_sections
+    if upper_for_filter:
+        rr_lines = _filter_sections_overlapping_upper_floor(rr_lines, upper_for_filter)
+        # Actualizăm remaining_mask.png cu dreptunghiurile corecte (filtrate)
+        _write_remaining_mask_from_sections(out_dir, rr_lines, wall_mask_path)
+        # a_lines, a_faces, pyramid_lines, shed_lines: folosim remaining_mask ca fundal
+        remaining_path = out_dir / "remaining_mask.png"
+        if remaining_path.exists():
+            mask_lines = str(remaining_path)
     # Unghi comun (ca la a_frame de la ultimul etaj) - folosit pentru pyramid, a_frame, shed
     roof_angle_deg = float(config.get("roof_angle", 30.0))
-    # Secțiuni etaj superior: pentru etaj ne‑top folosim upper_floor_sections_for_pyramid_lines
-    # (în coords măștii remaining) ca să nu desenăm diagonala piramidei pe laturile lipite de etaj
-    up_secs_pyramid = (
-        upper_floor_sections_for_pyramid_lines
-        if roof_result_for_2d_lines and upper_floor_sections_for_pyramid_lines
-        else (upper_floor_roof_sections if not roof_result_for_2d_lines else None)
-    )
 
     try:
         visualize_pyramid_lines(
@@ -332,8 +344,8 @@ def _generate_roof_outputs(
             output_path=str(out_dir / "pyramid_lines.png"),
             roof_angle_deg=roof_angle_deg,
             wall_height=300.0,
-            upper_floor_roof_sections=up_secs_pyramid,
-            upper_floor_footprint=None if roof_result_for_2d_lines else upper_floor_footprint,
+            upper_floor_roof_sections=upper_floor_roof_sections,
+            upper_floor_footprint=upper_floor_footprint,
         )
     except Exception:
         pass
@@ -345,7 +357,19 @@ def _generate_roof_outputs(
             output_path=str(out_dir / "a_lines.png"),
             roof_angle_deg=roof_angle_deg,
             wall_height=300.0,
-            upper_floor_roof_sections=None if roof_result_for_2d_lines else upper_floor_roof_sections,
+            upper_floor_roof_sections=upper_floor_roof_sections,
+        )
+    except Exception:
+        pass
+
+    try:
+        visualize_a_frame_faces(
+            mask_lines,
+            rr_lines,
+            output_path=str(out_dir / "a_faces.png"),
+            roof_angle_deg=roof_angle_deg,
+            wall_height=300.0,
+            upper_floor_roof_sections=upper_floor_roof_sections,
         )
     except Exception:
         pass
@@ -360,17 +384,38 @@ def _generate_roof_outputs(
             upper_floor_roof_sections=upper_floor_roof_sections,
             upper_floor_footprint=upper_floor_footprint,
             overhang_px=overhang_px,
-            mask_offset=mask_offset,
+            mask_offset=None,
         )
     except Exception:
         pass
 
-    # Nu scriem dreptunghiuri derivate din `remaining_mask` (nu au relevanță).
-
+    # remaining_mask.png: la etaj ne‑top, actualizăm cu dreptunghiurile corecte (filtrate)
     wall_mask_img = cv2.imread(wall_mask_path, cv2.IMREAD_GRAYSCALE)
     if wall_mask_img is None:
         return
     shape = wall_mask_img.shape
+
+    if upper_for_filter:
+        rects_remaining = []
+        for sec in rr_lines.get("sections") or []:
+            br = sec.get("bounding_rect", [])
+            if len(br) >= 3:
+                from shapely.geometry import Polygon as ShapelyPolygon
+                try:
+                    rects_remaining.append(ShapelyPolygon(br))
+                except Exception:
+                    pass
+        if rects_remaining:
+            remaining_mask = generate_binary_mask(rects_remaining, shape)
+            try:
+                from roof_calc.flood_fill import flood_fill_interior, get_house_shape_mask
+                filled = flood_fill_interior(wall_mask_img)
+                house_mask = get_house_shape_mask(filled)
+                if house_mask.shape == remaining_mask.shape:
+                    remaining_mask = np.minimum(remaining_mask, house_mask)
+            except Exception:
+                pass
+            cv2.imwrite(str(out_dir / "remaining_mask.png"), remaining_mask)
 
     sections = roof_result.get("sections", [])
     connections = roof_result.get("connections", [])
@@ -466,35 +511,114 @@ def _bbox_center_int(b: Tuple[int, int, int, int]) -> Tuple[int, int]:
     return ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
 
 
+def _polygon_from_path_for_offset(path: str) -> Optional[Any]:
+    """Încarcă poligonul etajului din imagine."""
+    from roof_calc.flood_fill import flood_fill_interior, get_house_shape_mask
+    from roof_calc.geometry import extract_polygon
+
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return None
+    filled = flood_fill_interior(img)
+    mask = get_house_shape_mask(filled)
+    poly = extract_polygon(mask)
+    if poly is None or poly.is_empty:
+        return None
+    return poly
+
+
+def _section_rect_center(sec: dict) -> Tuple[float, float]:
+    br = sec.get("bounding_rect") or []
+    if len(br) < 3:
+        return (0.0, 0.0)
+    xs = [float(p[0]) for p in br]
+    ys = [float(p[1]) for p in br]
+    return ((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0)
+
+
+def _section_area(sec: dict) -> float:
+    br = sec.get("bounding_rect") or []
+    if len(br) < 3:
+        return 0.0
+    xs = [float(p[0]) for p in br]
+    ys = [float(p[1]) for p in br]
+    return (max(xs) - min(xs)) * (max(ys) - min(ys))
+
+
 def _compute_overlay_offsets(floor_paths: List[str], roof_results: List[dict]) -> dict:
     """
-    Reproduce alinierea din `floors_overlay.png`: aliniază centrele celui mai mare dreptunghi per etaj.
-    Pixel-perfect: referință și centre întregi.
-    Returnează dict path -> (ox, oy) astfel încât (x + ox, y + oy) să fie în coordonatele overlay.
+    Aliniază etajele după dreptunghiul comun (același pe ambele etaje).
+    Dacă nu există dreptunghi comun, folosește centroidul celui mai mare etaj.
     """
-    bboxes: List[Tuple[int, int, int, int]] = []
-    for rr in roof_results:
-        bb = _largest_section_bbox(rr)
-        if bb is None:
-            bb = _get_largest_rect_bbox(rr)
-        if bb is None:
-            bb = (0, 0, 0, 0)
-        bboxes.append(bb)
-
-    widths = [b[2] - b[0] for b in bboxes]
-    heights = [b[3] - b[1] for b in bboxes]
-    max_w = max(widths) if widths else 0
-    max_h = max(heights) if heights else 0
-    padding = 50
-    ref_cx = int(round((max_w + 2 * padding) / 2))
-    ref_cy = int(round((max_h + 2 * padding) / 2))
-
+    polys = [_polygon_from_path_for_offset(p) for p in floor_paths]
+    best_idx = 0
+    best_area = -1.0
+    for i, poly in enumerate(polys):
+        if poly is not None and not poly.is_empty:
+            a = float(poly.area)
+            if a > best_area:
+                best_area = a
+                best_idx = i
+    cx_ref, cy_ref = 0.0, 0.0
+    ref_path = floor_paths[best_idx] if best_idx < len(floor_paths) else floor_paths[0]
+    if len(floor_paths) >= 2 and len(roof_results) >= 2:
+        rr_ref = roof_results[best_idx]
+        for other_idx, (p_oth, rr_oth) in enumerate(zip(floor_paths, roof_results)):
+            if other_idx == best_idx:
+                continue
+            for s_ref in rr_ref.get("sections") or []:
+                a_ref = _section_area(s_ref)
+                if a_ref <= 0:
+                    continue
+                for s_oth in rr_oth.get("sections") or []:
+                    a_oth = _section_area(s_oth)
+                    if a_oth <= 0:
+                        continue
+                    if min(a_ref, a_oth) / max(a_ref, a_oth) >= 0.9:
+                        cx_ref, cy_ref = _section_rect_center(s_ref)
+                        break
+                if cx_ref != 0 or cy_ref != 0:
+                    break
+            if cx_ref != 0 or cy_ref != 0:
+                break
+    if cx_ref == 0 and cy_ref == 0:
+        ref_poly = polys[best_idx] if best_idx < len(polys) else None
+        if ref_poly and not ref_poly.is_empty:
+            c = ref_poly.centroid
+            cx_ref, cy_ref = float(c.x), float(c.y)
     out = {}
-    for p, bb in zip(floor_paths, bboxes):
-        cx, cy = _bbox_center_int(bb)
-        ox = ref_cx - cx
-        oy = ref_cy - cy
-        out[p] = (ox, oy)
+    for p, poly in zip(floor_paths, polys):
+        if p == ref_path:
+            out[p] = (0, 0)
+            continue
+        found = False
+        if p in floor_paths:
+            pi = floor_paths.index(p)
+            if pi < len(roof_results):
+                rr_p = roof_results[pi]
+                rr_ref = roof_results[best_idx] if best_idx < len(roof_results) else None
+                if rr_ref:
+                    for s_p in rr_p.get("sections") or []:
+                        a_p = _section_area(s_p)
+                        if a_p <= 0:
+                            continue
+                        for s_ref in rr_ref.get("sections") or []:
+                            a_ref = _section_area(s_ref)
+                            if a_ref <= 0:
+                                continue
+                            if min(a_p, a_ref) / max(a_p, a_ref) >= 0.9:
+                                cxi, cyi = _section_rect_center(s_p)
+                                out[p] = (int(round(cx_ref - cxi)), int(round(cy_ref - cyi)))
+                                found = True
+                                break
+                        if found:
+                            break
+        if not found:
+            if poly is None or poly.is_empty:
+                out[p] = (int(round(-cx_ref)), int(round(-cy_ref)))
+            else:
+                c = poly.centroid
+                out[p] = (int(round(cx_ref - c.x)), int(round(cy_ref - c.y)))
     return out
 
 
@@ -515,6 +639,81 @@ def _translate_sections(sections: List[dict], dx: float, dy: float) -> List[dict
             }
         )
     return out
+
+
+def _write_remaining_mask_from_sections(
+    out_dir: Path,
+    roof_result: dict,
+    wall_mask_path: str,
+) -> None:
+    """Scrie remaining_mask.png din dreptunghiurile filtrate (secțiuni care rămân după excludere)."""
+    from shapely.geometry import Polygon as ShapelyPolygon
+
+    sections = roof_result.get("sections") or []
+    if not sections:
+        return
+    wall_img = cv2.imread(wall_mask_path, cv2.IMREAD_GRAYSCALE)
+    if wall_img is None:
+        return
+    shape = wall_img.shape
+    rectangles = []
+    for sec in sections:
+        br = sec.get("bounding_rect", [])
+        if len(br) >= 3:
+            try:
+                rect_poly = ShapelyPolygon(br)
+                if not rect_poly.is_empty:
+                    rectangles.append(rect_poly)
+            except Exception:
+                continue
+    if not rectangles:
+        return
+    remaining_mask = generate_binary_mask(rectangles, shape)
+    cv2.imwrite(str(out_dir / "remaining_mask.png"), remaining_mask)
+
+
+def _filter_sections_overlapping_upper_floor(
+    roof_result: dict,
+    upper_floor_sections: List[dict],
+    *,
+    area_tolerance: float = 0.10,
+) -> dict:
+    """
+    Elimină din roof_result secțiunile cu suprafață similară cu etajul superior.
+    Dacă un dreptunghi apare atât la parter cât și la etaj, îl afișăm doar la etaj.
+    Criteriu: suprafață în ±area_tolerance (ex. 731k vs 741k). Fără suprapunere spațială (crop-uri diferite).
+    """
+    from roof_calc.overhang import rect_bounds_from_bounding_rect
+
+    sections = roof_result.get("sections") or []
+    if not sections or not upper_floor_sections:
+        return roof_result
+
+    upper_areas = []
+    for sec in upper_floor_sections:
+        bb = rect_bounds_from_bounding_rect(sec.get("bounding_rect") or [])
+        if bb is not None:
+            area = (bb.maxx - bb.minx) * (bb.maxy - bb.miny)
+            upper_areas.append(area)
+
+    filtered = []
+    for sec in sections:
+        bb = rect_bounds_from_bounding_rect(sec.get("bounding_rect") or [])
+        if bb is None:
+            filtered.append(sec)
+            continue
+        area_a = (bb.maxx - bb.minx) * (bb.maxy - bb.miny)
+        exclude = False
+        for area_b in upper_areas:
+            if area_a > 0 and area_b > 0:
+                area_ratio = min(area_a, area_b) / max(area_a, area_b)
+                if area_ratio >= (1.0 - area_tolerance):
+                    exclude = True
+                    break
+        if not exclude:
+            filtered.append(sec)
+
+    return {**roof_result, "sections": filtered}
 
 
 def detect_floors_from_folder(folder_path: str) -> Tuple[List[str], Optional[str]]:
@@ -801,7 +1000,7 @@ def complete_workflow(wall_mask_path: str, output_dir: str = "output"):
             except Exception:
                 pass
         roof_floor_level = next((k for k in range(len(floors_ordered)) if floors_ordered[k][0] == roof_floor_path), 0)
-        print(f"   ✓ Linii acoperiș per etaj (din rectangles_floor): etaj_0..etaj_{len(floors_ordered)-1}/ (pyramid_lines, a_lines, shed_lines, drip_debug, drip_debug_shed)")
+        print(f"   ✓ Linii acoperiș per etaj (din rectangles_floor): etaj_0..etaj_{len(floors_ordered)-1}/ (pyramid_lines, a_lines, a_faces, shed_lines, drip_debug, drip_debug_shed)")
 
         # Roof unfolded: măști per față (fara_overhang, cu_overhang), lungimi streașini/burlane
         try:
@@ -869,7 +1068,7 @@ def complete_workflow(wall_mask_path: str, output_dir: str = "output"):
             )
         except Exception:
             pass
-        print(f"   ✓ Acoperiș principal: etaj_{roof_floor_level}/ (rectangles, roof_lines, pyramid_lines, a_lines, shed_lines, drip_debug, măști, texturi, fețe desfășurate)")
+        print(f"   ✓ Acoperiș principal: etaj_{roof_floor_level}/ (rectangles, roof_lines, pyramid_lines, a_lines, a_faces, shed_lines, drip_debug, măști, texturi, fețe desfășurate)")
 
         # Roof unfolded (single floor): fara_overhang, cu_overhang, lungimi_streasure_burlane.json
         try:
@@ -1025,6 +1224,81 @@ def complete_workflow(wall_mask_path: str, output_dir: str = "output"):
                 print("   ✓ Vizualizare 3D shed (Matplotlib): house_3d_shed.png")
         except Exception as e:
             print(f"   ⚠ Matplotlib 3D (shed) a eșuat: {e}")
+
+    ok_render = False
+    try:
+        ok_render = visualize_3d_house_render_plotly(
+            str(output_path / "house_render.png"),
+            config=_cfg_3d,
+            all_floor_paths=all_floors_for_3d,
+            floor_roof_results=floor_roof_results if floor_roof_results else None,
+            html_output_path=str(output_path / "house_render.html"),
+            roof_levels=[tuple(item[:5]) for item in roof_levels] if roof_levels else None,
+        )
+        if ok_render:
+            print("   ✓ Vizualizare 3D house_render (Plotly): house_render.png, house_render.html")
+    except Exception as e:
+        print(f"   ⚠ house_render 3D a eșuat: {e}")
+
+    ok_render_overhang = False
+    try:
+        ok_render_overhang = visualize_3d_house_render_plotly(
+            str(output_path / "house_render_overhang.png"),
+            config=_cfg_3d,
+            all_floor_paths=all_floors_for_3d,
+            floor_roof_results=floor_roof_results if floor_roof_results else None,
+            html_output_path=str(output_path / "house_render_overhang.html"),
+            roof_levels=[tuple(item[:5]) for item in roof_levels] if roof_levels else None,
+            extend_segments_mode=True,
+        )
+        if ok_render_overhang:
+            print("   ✓ Vizualizare 3D house_render_overhang (Plotly): house_render_overhang.png, house_render_overhang.html")
+    except Exception as e:
+        print(f"   ⚠ house_render_overhang 3D a eșuat: {e}")
+
+    ok_render_final = False
+    try:
+        ok_render_final = visualize_3d_house_render_plotly(
+            str(output_path / "house_render_final.png"),
+            config=_cfg_3d,
+            all_floor_paths=all_floors_for_3d,
+            floor_roof_results=floor_roof_results if floor_roof_results else None,
+            html_output_path=str(output_path / "house_render_final.html"),
+            roof_levels=[tuple(item[:5]) for item in roof_levels] if roof_levels else None,
+            final_mode=True,
+        )
+        if ok_render_final:
+            print("   ✓ Vizualizare 3D house_render_final (Plotly): house_render_final.png, house_render_final.html")
+    except Exception as e:
+        print(f"   ⚠ house_render_final 3D a eșuat: {e}")
+
+    ok_aframe = False
+    try:
+        ok_aframe = visualize_3d_a_frame_plotly(
+            str(output_path / "house_a_frame.png"),
+            config=_cfg_3d,
+            all_floor_paths=all_floors_for_3d,
+            floor_roof_results=floor_roof_results if floor_roof_results else None,
+            html_output_path=str(output_path / "house_a_frame.html"),
+            roof_levels=[tuple(item[:5]) for item in roof_levels] if roof_levels else None,
+        )
+        if ok_aframe:
+            print("   ✓ Vizualizare 3D A-frame (Plotly): house_a_frame.png, house_a_frame.html")
+    except Exception as e:
+        print(f"   ⚠ house_a_frame 3D a eșuat: {e}")
+    if not ok_aframe:
+        try:
+            ok_aframe = visualize_3d_a_frame_matplotlib(
+                str(output_path / "house_a_frame.png"),
+                config=_cfg_3d,
+                all_floor_paths=all_floors_for_3d,
+                floor_roof_results=floor_roof_results if floor_roof_results else None,
+                roof_levels=[tuple(item[:5]) for item in roof_levels] if roof_levels else None,
+            )
+            if ok_aframe:
+                print("   ✓ Vizualizare 3D A-frame (Matplotlib): house_a_frame.png")
+        except Exception as e:
+            print(f"   ⚠ house_a_frame 3D Matplotlib a eșuat: {e}")
 
     # Debug cilindri 2D – pentru toate tipurile de acoperiș
     _scripts_dir = str(ROOT / "scripts")

@@ -1,13 +1,13 @@
 {
   "face_id": 1,
   "label": "sec0_shed_1",
-  "width_units": 1035.0,
-  "height_units": 708.99,
-  "area_units_sq": 733815.0,
-  "width_px": 1035,
-  "height_px": 709,
-  "plan_h": 1683,
-  "plan_w": 2189,
+  "width_units": 955.0,
+  "height_units": 1645.45,
+  "area_units_sq": 1570975.0,
+  "width_px": 955,
+  "height_px": 1646,
+  "plan_h": 1808,
+  "plan_w": 1233,
   "units": "pixels (same as input plan)",
   "scale": "1 px in image = 1 unit in 3D (true unfolded dimensions)"
 }

@@ -1,0 +1,70 @@
+{
+  "streașini": {
+    "segments": [
+      {
+        "segment_id": 1,
+        "length_px": 1035.0,
+        "p1": [
+          1580.0,
+          1134.0
+        ],
+        "p2": [
+          545.0,
+          1134.0
+        ]
+      }
+    ],
+    "total_length_px": 1035.0,
+    "unitate": "pixeli (raportate la planul din care se face acoperișul)"
+  },
+  "burlane": {
+    "segments": [
+      {
+        "burlan_id": 1,
+        "length_px": 210.0,
+        "length_3d_px": 210.0,
+        "p1": [
+          507.17,
+          300.04,
+          0.0
+        ],
+        "p2": [
+          507.17,
+          300.04,
+          210.0
+        ]
+      }
+    ],
+    "total_length_px": 210.0,
+    "count": 1,
+    "unitate": "pixeli (lungime verticală)"
+  },
+  "conexiuni_streasure_burlane": {
+    "segments": [
+      {
+        "conexiune_id": 1,
+        "length_px": 849.84,
+        "length_2d_px": 844.91,
+        "p1": [
+          507.17,
+          300.04,
+          210.0
+        ],
+        "p2": [
+          545.0,
+          1144.11,
+          301.36
+        ]
+      }
+    ],
+    "total_length_px": 849.84,
+    "count": 1,
+    "unitate": "pixeli (lungime 3D)"
+  },
+  "render_meta": {
+    "z_gutter": 301.36,
+    "roof_angle_deg": 30.0,
+    "overhang_px": 60.17102708114595,
+    "wall_height": 300.0
+  }
+}

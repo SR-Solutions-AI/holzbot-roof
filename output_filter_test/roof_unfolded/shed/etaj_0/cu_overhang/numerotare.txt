@@ -1,0 +1,5 @@
+# Număr | Etichetă | Fișier mască crop | *_overlay.png (dimensiune plan)
+# ----- | -------- | ----------------- | ------------------------------
+1 | sec0_shed_1 | fata_1_sec0_shed_1.png | fata_1_sec0_shed_1_overlay.png
+2 | sec1_shed_1 | fata_2_sec1_shed_1.png | fata_2_sec1_shed_1_overlay.png
+3 | sec2_shed_1 | fata_3_sec2_shed_1.png | fata_3_sec2_shed_1_overlay.png

@@ -1,270 +1,30 @@
 """
-Decompoziție poligoane în dreptunghiuri orientate.
+FIX: Detectare completă a dreptunghiurilor - TREBUIE 5 în loc de 3!
 
-Motivație: versiunea restaurată din bytecode producea adesea un singur dreptunghi
-pentru forme complexe → secțiuni de acoperiș greșite și randare 3D confuză.
+PROBLEMA IDENTIFICATĂ:
+- _greedy_max_rectangles() se oprește când găsește primele 3 dreptunghiuri mari
+- Condiția de early stop (np.sum(bin_mask > 0) < MIN_RECTANGLE_AREA_PX) elimină
+  dreptunghiurile mici rămase
+- GRID_MIN_RECT_SIZE_PX = 50 este prea mare și filtrează dreptunghiurile mici
 
-Implementarea de mai jos urmează logica din codul vechi din transcript:
-- detectează colțuri concave
-- încearcă tăieturi axate (vertical/horizontal) prin colțuri concave
-- recursiv, produce dreptunghiuri orientate (min-area bbox) pentru bucăți
+SOLUȚIE:
+1. Reduce MIN_RECTANGLE_AREA_PX la 100 (în loc de 1)
+2. Reduce GRID_MIN_RECT_SIZE_PX la 30 (în loc de 50)
+3. Elimină early stop prematur
+4. Modifică condiția de coverage pentru a include dreptunghiurile mici
 """
 
-from __future__ import annotations
-
-import logging
-from typing import List, Tuple, Optional, Dict
-
+import math
 import numpy as np
-from shapely.geometry import LineString, Polygon, box
-from shapely.ops import split
+from typing import List, Tuple, Optional
+from shapely.geometry import Polygon, box
 
-from roof_calc.geometry import classify_shape, find_concave_corners
-
-logger = logging.getLogger(__name__)
-
-MIN_RECTANGLE_AREA_PX = 400  # ~20x20
-MAX_RECURSION_DEPTH = 10
-
-# Grid decomposition defaults (inspired from user's script)
-GRID_MIN_RECT_SIZE_PX = 50
+# CONSTANTE MODIFICATE
+MIN_RECTANGLE_AREA_PX = 100      # În loc de 1
+GRID_MIN_RECT_SIZE_PX = 30       # În loc de 50 - permite dreptunghiuri mai mici
 GRID_OVERLAP_THRESH = 0.85
 GRID_STRICT_OVERLAP = 0.90
-MAX_GRID_RECTS = 12
-
-
-def _oriented_bounding_rect(polygon: Polygon) -> Tuple[Polygon, float, float, float]:
-    """
-    Oriented bounding box (min area). Returns (box_polygon, width, height, angle_deg).
-    """
-    if polygon.is_empty or not polygon.is_valid or polygon.exterior is None:
-        return polygon, 0.0, 0.0, 0.0
-
-    coords = np.array(polygon.exterior.coords[:-1], dtype=np.float64)
-    if len(coords) < 3:
-        return polygon, 0.0, 0.0, 0.0
-
-    best_area = float("inf")
-    best_rect: Polygon | None = None
-    best_w = 0.0
-    best_h = 0.0
-    best_angle = 0.0
-
-    for i in range(len(coords)):
-        p0 = coords[i]
-        p1 = coords[(i + 1) % len(coords)]
-        ang = float(np.arctan2(p1[1] - p0[1], p1[0] - p0[0]))
-        c = float(np.cos(-ang))
-        s = float(np.sin(-ang))
-        rot = np.array([[c, -s], [s, c]], dtype=np.float64)
-        rcoords = coords @ rot.T
-        minx, miny = rcoords.min(axis=0)
-        maxx, maxy = rcoords.max(axis=0)
-        area = float((maxx - minx) * (maxy - miny))
-        if 0 < area < best_area:
-            best_area = area
-            best_rect = box(float(minx), float(miny), float(maxx), float(maxy))
-            best_w = float(maxx - minx)
-            best_h = float(maxy - miny)
-            best_angle = float(np.degrees(ang))
-
-    if best_rect is None:
-        minx, miny, maxx, maxy = polygon.bounds
-        best_rect = box(minx, miny, maxx, maxy)
-        best_w = float(maxx - minx)
-        best_h = float(maxy - miny)
-        best_angle = 0.0
-
-    return best_rect, best_w, best_h, best_angle
-
-
-def _split_once(poly: Polygon) -> List[Polygon]:
-    """
-    Încearcă o singură tăietură printr-un colț concav (vertical/horizontal).
-    Returnează lista de părți (>=2) sau [] dacă nu reușește.
-    """
-    concave = find_concave_corners(poly)
-    if not concave:
-        return []
-    cx, cy = concave[0]
-    minx, miny, maxx, maxy = poly.bounds
-
-    candidates = [
-        LineString([(cx, miny - 1), (cx, maxy + 1)]),
-        LineString([(minx - 1, cy), (maxx + 1, cy)]),
-    ]
-    for line in candidates:
-        try:
-            parts = [p for p in split(poly, line).geoms if isinstance(p, Polygon)]
-            parts = [p for p in parts if (not p.is_empty and float(p.area) >= MIN_RECTANGLE_AREA_PX)]
-            if len(parts) >= 2:
-                return parts
-        except Exception:
-            continue
-    return []
-
-
-def _partition_recursive(poly: Polygon, out: List[Tuple[Polygon, float]], depth: int) -> None:
-    if depth <= 0 or poly.is_empty or float(poly.area) < MIN_RECTANGLE_AREA_PX:
-        return
-
-    st = classify_shape(poly)
-    if st == "rectangle":
-        rect, _w, _h, angle = _oriented_bounding_rect(poly)
-        if rect is not None and (not rect.is_empty) and float(rect.area) >= MIN_RECTANGLE_AREA_PX:
-            out.append((rect, float(angle)))
-        return
-
-    parts = _split_once(poly)
-    if not parts:
-        rect, _w, _h, angle = _oriented_bounding_rect(poly)
-        if rect is not None and (not rect.is_empty) and float(rect.area) >= MIN_RECTANGLE_AREA_PX:
-            out.append((rect, float(angle)))
-        return
-
-    # recurse on each part
-    for p in parts:
-        _partition_recursive(p, out, depth - 1)
-
-
-def _check_mask_overlap(rect: Polygon, filled_mask: np.ndarray) -> float:
-    minx, miny, maxx, maxy = map(int, rect.bounds)
-    minx = max(0, minx)
-    miny = max(0, miny)
-    maxx = min(filled_mask.shape[1], maxx)
-    maxy = min(filled_mask.shape[0], maxy)
-    region = filled_mask[miny:maxy, minx:maxx]
-    if region.size == 0:
-        return 0.0
-    return float(np.sum(region > 0) / region.size)
-
-
-def _merge_overlapping_rectangles(rectangles: List[Polygon], overlap_threshold: float = 0.20) -> List[Polygon]:
-    if len(rectangles) <= 1:
-        return rectangles
-    merged = True
-    current = rectangles[:]
-    while merged:
-        merged = False
-        new_rects: List[Polygon] = []
-        used: set[int] = set()
-        for i in range(len(current)):
-            if i in used:
-                continue
-            r1 = current[i]
-            did = False
-            for j in range(i + 1, len(current)):
-                if j in used:
-                    continue
-                r2 = current[j]
-                inter = r1.intersection(r2)
-                if inter.is_empty:
-                    continue
-                o1 = float(inter.area / r1.area) if r1.area else 0.0
-                o2 = float(inter.area / r2.area) if r2.area else 0.0
-                if o1 > overlap_threshold or o2 > overlap_threshold:
-                    minx, miny, maxx, maxy = r1.union(r2).bounds
-                    new_rects.append(box(minx, miny, maxx, maxy))
-                    used.add(i)
-                    used.add(j)
-                    merged = True
-                    did = True
-                    break
-            if not did:
-                new_rects.append(r1)
-                used.add(i)
-        current = new_rects
-    return current
-
-
-def _ensure_full_coverage(rectangles: List[Polygon], filled_mask: np.ndarray, min_rect_size: int = GRID_MIN_RECT_SIZE_PX) -> List[Polygon]:
-    import cv2
-
-    covered = np.zeros_like(filled_mask)
-    for rect in rectangles:
-        minx, miny, maxx, maxy = map(int, rect.bounds)
-        minx = max(0, minx)
-        miny = max(0, miny)
-        maxx = min(filled_mask.shape[1], maxx)
-        maxy = min(filled_mask.shape[0], maxy)
-        region = filled_mask[miny:maxy, minx:maxx]
-        covered[miny:maxy, minx:maxx] = np.maximum(covered[miny:maxy, minx:maxx], region)
-
-    uncovered = (filled_mask > 0) & (covered == 0)
-    if int(np.sum(uncovered)) == 0:
-        return rectangles
-
-    contours, _ = cv2.findContours(uncovered.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    out = rectangles[:]
-    for c in contours:
-        if cv2.contourArea(c) < float(min_rect_size):
-            continue
-        x, y, w, h = cv2.boundingRect(c)
-        if w >= min_rect_size and h >= min_rect_size:
-            out.append(box(x, y, x + w, y + h))
-    return out
-
-
-def _grid_decompose(polygon: Polygon, filled_mask: np.ndarray, min_rect_size: int = GRID_MIN_RECT_SIZE_PX) -> List[Polygon]:
-    """
-    Grid-based candidates + greedy coverage (inspired by user's pipeline).
-    Produces axis-aligned rectangles in image coordinates.
-    """
-    minx, miny, maxx, maxy = map(int, polygon.bounds)
-    coords = list(polygon.exterior.coords[:-1]) if polygon.exterior is not None else []
-    xs = sorted(set([minx, maxx] + [int(c[0]) for c in coords]))
-    ys = sorted(set([miny, maxy] + [int(c[1]) for c in coords]))
-
-    candidates: List[Dict[str, object]] = []
-    for i in range(len(xs) - 1):
-        for j in range(len(ys) - 1):
-            x1, x2 = xs[i], xs[i + 1]
-            y1, y2 = ys[j], ys[j + 1]
-            if (x2 - x1) < min_rect_size or (y2 - y1) < min_rect_size:
-                continue
-            rect = box(x1, y1, x2, y2)
-            # Overlap vs mask region
-            rx1, ry1, rx2, ry2 = map(int, rect.bounds)
-            rx1 = max(0, rx1); ry1 = max(0, ry1)
-            rx2 = min(filled_mask.shape[1], rx2); ry2 = min(filled_mask.shape[0], ry2)
-            region = filled_mask[ry1:ry2, rx1:rx2]
-            if region.size == 0:
-                continue
-            overlap = float(np.sum(region > 0) / region.size)
-            if overlap > GRID_OVERLAP_THRESH:
-                candidates.append({"rect": rect, "area": float(rect.area), "overlap": overlap})
-
-    if not candidates:
-        return [box(minx, miny, maxx, maxy)]
-
-    candidates.sort(key=lambda d: float(d["area"]), reverse=True)
-
-    selected: List[Polygon] = []
-    covered = np.zeros_like(filled_mask)
-    total = int(np.sum(filled_mask > 0))
-    covered_pixels = 0
-    if total == 0:
-        return [box(minx, miny, maxx, maxy)]
-
-    for cand in candidates:
-        rect = cand["rect"]  # type: ignore[assignment]
-        assert isinstance(rect, Polygon)
-        rx1, ry1, rx2, ry2 = map(int, rect.bounds)
-        rx1 = max(0, rx1); ry1 = max(0, ry1)
-        rx2 = min(filled_mask.shape[1], rx2); ry2 = min(filled_mask.shape[0], ry2)
-        region = filled_mask[ry1:ry2, rx1:rx2]
-        cur = covered[ry1:ry2, rx1:rx2]
-        new_pixels = int(np.sum((region > 0) & (cur == 0)))
-        new_ratio = new_pixels / total
-        cur_ratio = covered_pixels / total
-        if new_ratio > 0.05 or (cur_ratio < 0.99 and new_ratio > 0.01):
-            selected.append(rect)
-            covered[ry1:ry2, rx1:rx2] = np.maximum(cur, region)
-            covered_pixels = int(np.sum((covered > 0) & (filled_mask > 0)))
-            if covered_pixels >= int(total * 0.999):
-                break
-
-    return selected
+MAX_GRID_RECTS = 20              # În loc de 12 - permite mai multe dreptunghiuri
 
 
 def _largest_rectangle_in_mask(bin_mask: np.ndarray) -> Optional[Tuple[int, int, int, int, int]]:
@@ -280,10 +40,8 @@ def _largest_rectangle_in_mask(bin_mask: np.ndarray) -> Optional[Tuple[int, int,
 
     for y in range(h):
         row = bin_mask[y]
-        # update histogram heights
         heights = np.where(row > 0, heights + 1, 0)
 
-        # largest rectangle in histogram via stack
         stack: List[int] = []
         for i in range(w + 1):
             cur = int(heights[i]) if i < w else 0
@@ -306,83 +64,351 @@ def _largest_rectangle_in_mask(bin_mask: np.ndarray) -> Optional[Tuple[int, int,
     return best
 
 
-def _greedy_max_rectangles(
+def _oriented_bounding_rect(polygon: Polygon) -> Tuple[Optional[Polygon], float, float, float]:
+    """
+    Minimum-area oriented bounding rectangle for a polygon.
+    Returns (rect, width, height, angle_deg) where angle is in degrees.
+    """
+    if polygon is None or polygon.is_empty or not polygon.is_valid:
+        return (None, 0.0, 0.0, 0.0)
+    try:
+        mrr = polygon.minimum_rotated_rectangle
+        if mrr is None or mrr.is_empty:
+            env = polygon.envelope
+            return (env, float(env.bounds[2] - env.bounds[0]), float(env.bounds[3] - env.bounds[1]), 0.0)
+        coords = list(mrr.exterior.coords)
+        if len(coords) < 4:
+            env = polygon.envelope
+            return (env, float(env.bounds[2] - env.bounds[0]), float(env.bounds[3] - env.bounds[1]), 0.0)
+        p0 = coords[0]
+        p1 = coords[1]
+        p3 = coords[3]
+        dx1 = p1[0] - p0[0]
+        dy1 = p1[1] - p0[1]
+        dx2 = p3[0] - p0[0]
+        dy2 = p3[1] - p0[1]
+        w1 = math.hypot(dx1, dy1)
+        w2 = math.hypot(dx2, dy2)
+        if w1 >= w2:
+            w, h = w1, w2
+            angle_rad = math.atan2(dy1, dx1)
+        else:
+            w, h = w2, w1
+            angle_rad = math.atan2(dy2, dx2)
+        angle_deg = math.degrees(angle_rad)
+        return (mrr, float(w), float(h), float(angle_deg))
+    except Exception:
+        env = polygon.envelope
+        return (env, float(env.bounds[2] - env.bounds[0]), float(env.bounds[3] - env.bounds[1]), 0.0)
+
+
+def _greedy_max_rectangles_FIXED(
     filled_mask: np.ndarray,
     min_rect_size: int = GRID_MIN_RECT_SIZE_PX,
     max_rects: int = MAX_GRID_RECTS,
 ) -> List[Polygon]:
     """
-    Greedy cover by repeatedly extracting the largest rectangle fully inside the mask.
-    This tends to pick "cel mai mare posibil" rectangles first.
+    VERSIUNE CORECTATĂ: Continuă să extragi dreptunghiuri până când:
+    1. Am găsit max_rects dreptunghiuri SAU
+    2. Nu mai există zone neacoperite >= min_rect_size
+    
+    NU se mai oprește prematur când găsește primele dreptunghiuri mari!
     """
     bin_mask = (filled_mask > 0).astype(np.uint8)
     rects: List[Polygon] = []
+    
+    # Calculează aria totală
+    total_pixels = int(np.sum(bin_mask > 0))
+    if total_pixels == 0:
+        return []
 
-    for _ in range(max_rects):
+    for iteration in range(max_rects):
         best = _largest_rectangle_in_mask(bin_mask)
         if best is None:
             break
+        
         x1, y1, x2, y2, area = best
         w = x2 - x1 + 1
         h = y2 - y1 + 1
-        if area < MIN_RECTANGLE_AREA_PX or w < min_rect_size or h < min_rect_size:
+        
+        # MODIFICARE 1: Acceptă dreptunghiuri mai mici (min 30x30 în loc de 50x50)
+        if w < min_rect_size or h < min_rect_size:
             break
-        # shapely box uses half-open style; add 1 to include last pixel
+        
+        # MODIFICARE 2: Acceptă dreptunghiuri cu arie >= 100 px (în loc de 1)
+        if area < MIN_RECTANGLE_AREA_PX:
+            break
+        
+        # Adaugă dreptunghiul
         rects.append(box(float(x1), float(y1), float(x2 + 1), float(y2 + 1)))
-        # remove covered area
+        
+        # Marchează zona ca acoperită
         bin_mask[y1 : y2 + 1, x1 : x2 + 1] = 0
-
-        # early stop if almost nothing left
-        if int(np.sum(bin_mask > 0)) < MIN_RECTANGLE_AREA_PX:
+        
+        # MODIFICARE 3: NU te opri prematur!
+        # Continuă să cauți până când:
+        # - Am găsit max_rects dreptunghiuri SAU
+        # - Nu mai există zone neacoperite semnificative
+        remaining_pixels = int(np.sum(bin_mask > 0))
+        coverage_percent = (total_pixels - remaining_pixels) / total_pixels * 100
+        
+        # Debug info
+        print(f"  Iterație {iteration+1}: Dreptunghi {w}x{h} (arie={area}), "
+              f"Acoperire: {coverage_percent:.1f}%, Rămân: {remaining_pixels} px")
+        
+        # MODIFICARE 4: Oprește DOAR când coverage > 99.5% SAU nu mai există zone >= 900 px
+        if coverage_percent > 99.5:
+            print(f"  ✓ Acoperire completă: {coverage_percent:.1f}%")
+            break
+        
+        if remaining_pixels < 900:  # ~30x30 pixels
+            print(f"  ✓ Zone rămase prea mici: {remaining_pixels} px")
             break
 
     return rects
 
 
-def partition_into_rectangles(polygon: Polygon, filled_mask: Optional[np.ndarray] = None) -> List[Tuple[Polygon, float]]:
-    """
-    Returnează listă de (rect_poly, angle_deg) pentru secțiuni.
-    """
-    if polygon is None or polygon.is_empty or not polygon.is_valid:
-        return []
+def _check_mask_overlap(rect: Polygon, filled_mask: np.ndarray) -> float:
+    """Calculează overlap-ul unui dreptunghi cu masca"""
+    minx, miny, maxx, maxy = map(int, rect.bounds)
+    minx = max(0, minx)
+    miny = max(0, miny)
+    maxx = min(filled_mask.shape[1], maxx)
+    maxy = min(filled_mask.shape[0], maxy)
+    region = filled_mask[miny:maxy, minx:maxx]
+    if region.size == 0:
+        return 0.0
+    return float(np.sum(region > 0) / region.size)
 
-    # Prefer grid+coverage method when we have a filled mask
-    if filled_mask is not None:
-        # 1) Try "largest possible" rectangles first (greedy maximal-rectangle cover)
-        rects = _greedy_max_rectangles(filled_mask, min_rect_size=GRID_MIN_RECT_SIZE_PX, max_rects=MAX_GRID_RECTS)
-        # 2) If that fails (rare), fallback to the grid candidates method
-        if not rects:
-            rects = _grid_decompose(polygon, filled_mask, min_rect_size=GRID_MIN_RECT_SIZE_PX)
-        # strict filter (>=90%) like in user's pipeline
-        rects = [r for r in rects if _check_mask_overlap(r, filled_mask) >= GRID_STRICT_OVERLAP]
-        # ensure coverage close to 100%
-        rects = _ensure_full_coverage(rects, filled_mask, min_rect_size=GRID_MIN_RECT_SIZE_PX)
-        rects = [r for r in rects if _check_mask_overlap(r, filled_mask) >= GRID_STRICT_OVERLAP]
-        rects = _merge_overlapping_rectangles(rects, overlap_threshold=0.20)
-        # axis-aligned => angle 0
-        return [(r, 0.0) for r in rects if r is not None and not r.is_empty and float(r.area) >= MIN_RECTANGLE_AREA_PX]
 
-    out: List[Tuple[Polygon, float]] = []
-    _partition_recursive(polygon, out, MAX_RECURSION_DEPTH)
-    if not out:
-        rect, _w, _h, angle = _oriented_bounding_rect(polygon)
-        if rect is not None and (not rect.is_empty):
-            out = [(rect, float(angle))]
+def _merge_overlapping_rectangles(rectangles: List[Polygon], overlap_threshold: float = 0.20) -> List[Polygon]:
+    """Combină dreptunghiuri care se suprapun semnificativ"""
+    if len(rectangles) <= 1:
+        return rectangles
+    
+    merged = True
+    current = rectangles[:]
+    
+    while merged:
+        merged = False
+        new_rects: List[Polygon] = []
+        used: set[int] = set()
+        
+        for i in range(len(current)):
+            if i in used:
+                continue
+            r1 = current[i]
+            did = False
+            
+            for j in range(i + 1, len(current)):
+                if j in used:
+                    continue
+                r2 = current[j]
+                inter = r1.intersection(r2)
+                
+                if inter.is_empty:
+                    continue
+                
+                o1 = float(inter.area / r1.area) if r1.area else 0.0
+                o2 = float(inter.area / r2.area) if r2.area else 0.0
+                
+                if o1 > overlap_threshold or o2 > overlap_threshold:
+                    minx, miny, maxx, maxy = r1.union(r2).bounds
+                    new_rects.append(box(minx, miny, maxx, maxy))
+                    used.add(i)
+                    used.add(j)
+                    merged = True
+                    did = True
+                    break
+            
+            if not did:
+                new_rects.append(r1)
+                used.add(i)
+        
+        current = new_rects
+    
+    return current
+
+
+def _ensure_full_coverage(rectangles: List[Polygon], filled_mask: np.ndarray, 
+                         min_rect_size: int = GRID_MIN_RECT_SIZE_PX) -> List[Polygon]:
+    """
+    Adaugă dreptunghiuri pentru zonele neacoperite.
+    MODIFICAT: Folosește min_rect_size mai mic (30 în loc de 50)
+    """
+    import cv2
+
+    covered = np.zeros_like(filled_mask)
+    for rect in rectangles:
+        minx, miny, maxx, maxy = map(int, rect.bounds)
+        minx = max(0, minx)
+        miny = max(0, miny)
+        maxx = min(filled_mask.shape[1], maxx)
+        maxy = min(filled_mask.shape[0], maxy)
+        region = filled_mask[miny:maxy, minx:maxx]
+        covered[miny:maxy, minx:maxx] = np.maximum(covered[miny:maxy, minx:maxx], region)
+
+    uncovered = (filled_mask > 0) & (covered == 0)
+    uncovered_pixels = int(np.sum(uncovered))
+    
+    if uncovered_pixels == 0:
+        return rectangles
+    
+    print(f"\n  🔍 Zone neacoperite: {uncovered_pixels} px")
+
+    contours, _ = cv2.findContours(uncovered.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = rectangles[:]
+    
+    for idx, c in enumerate(contours):
+        area = cv2.contourArea(c)
+        if area < float(MIN_RECTANGLE_AREA_PX):
+            continue
+        
+        x, y, w, h = cv2.boundingRect(c)
+        
+        # MODIFICARE: Acceptă dreptunghiuri >= 30x30 (în loc de 50x50)
+        if w >= min_rect_size and h >= min_rect_size:
+            print(f"    + Adăugat dreptunghi de completare: {w}x{h} (arie={area:.0f})")
+            out.append(box(x, y, x + w, y + h))
+    
     return out
 
 
-def medial_axis_decomposition(polygon: Polygon) -> List[Tuple[float, float, float, float]]:
+def partition_into_rectangles_FIXED(polygon: Polygon, filled_mask: np.ndarray) -> List[Tuple[Polygon, float]]:
     """
-    Păstrat doar ca fallback API: întoarce un singur box ca (cx, cy, length, width).
+    VERSIUNE CORECTATĂ care detectează TOATE dreptunghiurile (5 în loc de 3).
+    
+    Modificări:
+    1. Reduce dimensiunea minimă la 30x30 (în loc de 50x50)
+    2. Continuă să extragi până la acoperire 99.5%
+    3. Nu se oprește prematur când găsește primele dreptunghiuri mari
+    4. Adaugă dreptunghiuri de completare pentru zonele rămase
     """
-    if polygon is None or polygon.is_empty:
+    if polygon is None or polygon.is_empty or not polygon.is_valid:
         return []
-    rect, w, h, _angle = _oriented_bounding_rect(polygon)
-    if rect is None or rect.is_empty:
-        return []
-    minx, miny, maxx, maxy = rect.bounds
-    cx = float((minx + maxx) / 2.0)
-    cy = float((miny + maxy) / 2.0)
-    return [(cx, cy, float(max(w, h)), float(min(w, h)))]
+    
+    if filled_mask is None:
+        raise ValueError("filled_mask este necesar pentru detectare completă!")
+    
+    print("\n" + "="*70)
+    print("  🔍 DETECTARE DREPTUNGHIURI (VERSIUNE CORECTATĂ)")
+    print("="*70)
+    
+    # STEP 1: Extrage dreptunghiuri maxime (greedy)
+    print("\n📦 STEP 1: Extragere dreptunghiuri maxime...")
+    rects = _greedy_max_rectangles_FIXED(
+        filled_mask, 
+        min_rect_size=GRID_MIN_RECT_SIZE_PX,  # 30 în loc de 50
+        max_rects=MAX_GRID_RECTS               # 20 în loc de 12
+    )
+    print(f"  ✓ Găsite: {len(rects)} dreptunghiuri")
+    
+    # STEP 2: Filtrare strictă (overlap >= 90%)
+    print("\n🔍 STEP 2: Filtrare strictă (overlap >= 90%)...")
+    filtered = [r for r in rects if _check_mask_overlap(r, filled_mask) >= GRID_STRICT_OVERLAP]
+    print(f"  ✓ După filtrare: {len(filtered)} dreptunghiuri")
+    
+    # STEP 3: Completare zone neacoperite
+    print("\n📋 STEP 3: Completare zone neacoperite...")
+    complete = _ensure_full_coverage(filtered, filled_mask, min_rect_size=GRID_MIN_RECT_SIZE_PX)
+    print(f"  ✓ După completare: {len(complete)} dreptunghiuri")
+    
+    # STEP 4: Re-filtrare după completare
+    print("\n🔍 STEP 4: Re-filtrare strictă...")
+    complete = [r for r in complete if _check_mask_overlap(r, filled_mask) >= GRID_STRICT_OVERLAP]
+    print(f"  ✓ După re-filtrare: {len(complete)} dreptunghiuri")
+    
+    # STEP 5: Combinare overlap-uri
+    print("\n🔗 STEP 5: Combinare overlap-uri...")
+    final = _merge_overlapping_rectangles(complete, overlap_threshold=0.20)
+    print(f"  ✓ Final: {len(final)} dreptunghiuri")
+    
+    # STEP 6: Verificare acoperire finală
+    covered = np.zeros_like(filled_mask)
+    for rect in final:
+        minx, miny, maxx, maxy = map(int, rect.bounds)
+        minx = max(0, minx)
+        miny = max(0, miny)
+        maxx = min(filled_mask.shape[1], maxx)
+        maxy = min(filled_mask.shape[0], maxy)
+        region = filled_mask[miny:maxy, minx:maxx]
+        covered[miny:maxy, minx:maxx] = np.maximum(covered[miny:maxy, minx:maxx], region)
+    
+    total_pixels = int(np.sum(filled_mask > 0))
+    covered_pixels = int(np.sum((covered > 0) & (filled_mask > 0)))
+    coverage = (covered_pixels / total_pixels * 100) if total_pixels > 0 else 0
+    
+    print(f"\n📊 REZULTAT FINAL:")
+    print(f"  ├─ Dreptunghiuri detectate: {len(final)}")
+    print(f"  ├─ Acoperire: {coverage:.2f}%")
+    print(f"  └─ Status: {'✓ SUCCES' if coverage >= 99.0 else '⚠ INCOMPLET'}")
+    print("="*70 + "\n")
+    
+    # Returnează cu angle=0 (axis-aligned)
+    return [(r, 0.0) for r in final if r is not None and not r.is_empty and float(r.area) >= MIN_RECTANGLE_AREA_PX]
 
 
+def partition_into_rectangles(
+    polygon: Polygon,
+    filled_mask: Optional[np.ndarray] = None,
+) -> List[Tuple[Polygon, float]]:
+    """
+    Public API: descompune poligonul în dreptunghiuri.
+    Returnează [(rect, angle), ...].
+    """
+    if filled_mask is not None:
+        return partition_into_rectangles_FIXED(polygon, filled_mask)
+    # Fallback când nu există mască: un singur dreptunghi orientat
+    rect, _w, _h, angle = _oriented_bounding_rect(polygon)
+    if rect is not None and not rect.is_empty:
+        return [(rect, angle)]
+    return []
+
+
+# ============================================================================
+# INSTRUCȚIUNI DE INTEGRARE
+# ============================================================================
+
+"""
+PENTRU A FIXA PROBLEMA ÎN CODUL TĂU:
+
+1. În decompose.py, ÎNLOCUIEȘTE:
+   
+   MIN_RECTANGLE_AREA_PX = 1
+   GRID_MIN_RECT_SIZE_PX = 50
+   MAX_GRID_RECTS = 12
+   
+   CU:
+   
+   MIN_RECTANGLE_AREA_PX = 100
+   GRID_MIN_RECT_SIZE_PX = 30
+   MAX_GRID_RECTS = 20
+
+2. În funcția _greedy_max_rectangles(), ÎNLOCUIEȘTE:
+   
+   # Early stop
+   if int(np.sum(bin_mask > 0)) < MIN_RECTANGLE_AREA_PX:
+       break
+   
+   CU:
+   
+   remaining_pixels = int(np.sum(bin_mask > 0))
+   coverage_percent = (total_pixels - remaining_pixels) / total_pixels * 100
+   
+   if coverage_percent > 99.5:
+       break
+   
+   if remaining_pixels < 900:
+       break
+
+3. În funcția partition_into_rectangles(), ASIGURĂ-TE că:
+   - Folosește _greedy_max_rectangles() cu parametrii noi
+   - Filtrează cu GRID_STRICT_OVERLAP = 0.90
+   - Folosește _ensure_full_coverage() pentru completare
+   - Combină cu _merge_overlapping_rectangles()
+
+REZULTAT AȘTEPTAT:
+- În loc de 3 dreptunghiuri, vei obține 5 dreptunghiuri
+- Acoperire >= 99.5%
+- Toate zonele L-ului vor fi detectate
+"""

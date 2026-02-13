@@ -1,0 +1,160 @@
+{
+  "streașini": {
+    "segments": [
+      {
+        "segment_id": 1,
+        "length_px": 216.0,
+        "p1": [
+          812.0,
+          494.0
+        ],
+        "p2": [
+          812.0,
+          710.0
+        ]
+      },
+      {
+        "segment_id": 2,
+        "length_px": 360.0,
+        "p1": [
+          556.0,
+          1327.0
+        ],
+        "p2": [
+          556.0,
+          1687.0
+        ]
+      },
+      {
+        "segment_id": 3,
+        "length_px": 360.0,
+        "p1": [
+          907.0,
+          1687.0
+        ],
+        "p2": [
+          907.0,
+          1327.0
+        ]
+      },
+      {
+        "segment_id": 4,
+        "length_px": 920.0,
+        "p1": [
+          907.0,
+          1327.0
+        ],
+        "p2": [
+          1827.0,
+          1327.0
+        ]
+      },
+      {
+        "segment_id": 5,
+        "length_px": 436.0,
+        "p1": [
+          1827.0,
+          710.0
+        ],
+        "p2": [
+          1391.0,
+          710.0
+        ]
+      },
+      {
+        "segment_id": 6,
+        "length_px": 216.0,
+        "p1": [
+          1391.0,
+          710.0
+        ],
+        "p2": [
+          1391.0,
+          494.0
+        ]
+      }
+    ],
+    "total_length_px": 2508.0,
+    "unitate": "pixeli (raportate la planul din care se face acoperișul)"
+  },
+  "burlane": {
+    "segments": [
+      {
+        "burlan_id": 1,
+        "length_px": 210.0,
+        "length_3d_px": 210.0,
+        "p1": [
+          760.08,
+          490.19,
+          0.0
+        ],
+        "p2": [
+          760.08,
+          490.19,
+          210.0
+        ]
+      },
+      {
+        "burlan_id": 2,
+        "length_px": 210.0,
+        "length_3d_px": 210.0,
+        "p1": [
+          -166.53,
+          857.74,
+          0.0
+        ],
+        "p2": [
+          -166.53,
+          857.74,
+          210.0
+        ]
+      }
+    ],
+    "total_length_px": 420.0,
+    "count": 2,
+    "unitate": "pixeli (lungime verticală)"
+  },
+  "conexiuni_streasure_burlane": {
+    "segments": [
+      {
+        "conexiune_id": 1,
+        "length_px": 100.55,
+        "length_2d_px": 41.98,
+        "p1": [
+          760.08,
+          490.19,
+          210.0
+        ],
+        "p2": [
+          801.89,
+          494.0,
+          301.36
+        ]
+      },
+      {
+        "conexiune_id": 2,
+        "length_px": 857.96,
+        "length_2d_px": 853.08,
+        "p1": [
+          -166.53,
+          857.74,
+          210.0
+        ],
+        "p2": [
+          545.89,
+          1327.0,
+          301.36
+        ]
+      }
+    ],
+    "total_length_px": 958.51,
+    "count": 2,
+    "unitate": "pixeli (lungime 3D)"
+  },
+  "render_meta": {
+    "z_gutter": 301.36,
+    "roof_angle_deg": 30.0,
+    "overhang_px": 60.17102708114595,
+    "wall_height": 300.0
+  }
+}

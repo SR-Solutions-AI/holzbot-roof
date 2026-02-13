@@ -3,54 +3,54 @@
     "segments": [
       {
         "segment_id": 1,
-        "length_px": 1035.0,
+        "length_px": 955.0,
         "p1": [
-          545.0,
-          520.0
+          142.0,
+          199.0
         ],
         "p2": [
-          1580.0,
-          520.0
+          1097.0,
+          199.0
         ]
       },
       {
         "segment_id": 2,
-        "length_px": 614.0,
+        "length_px": 1425.0,
         "p1": [
-          1580.0,
-          520.0
+          1097.0,
+          199.0
         ],
         "p2": [
-          1580.0,
-          1134.0
+          1097.0,
+          1624.0
         ]
       },
       {
         "segment_id": 3,
-        "length_px": 1035.0,
+        "length_px": 955.0,
         "p1": [
-          1580.0,
-          1134.0
+          1097.0,
+          1624.0
         ],
         "p2": [
-          545.0,
-          1134.0
+          142.0,
+          1624.0
         ]
       },
       {
         "segment_id": 4,
-        "length_px": 614.0,
+        "length_px": 1425.0,
         "p1": [
-          545.0,
-          1134.0
+          142.0,
+          1624.0
         ],
         "p2": [
-          545.0,
-          520.0
+          142.0,
+          199.0
         ]
       }
     ],
-    "total_length_px": 3298.0,
+    "total_length_px": 4760.0,
     "unitate": "pixeli (raportate la planul din care se face acoperișul)"
   },
   "burlane": {
@@ -60,13 +60,13 @@
         "length_px": 210.0,
         "length_3d_px": 210.0,
         "p1": [
-          507.17,
-          300.04,
+          468.12,
+          699.78,
           0.0
         ],
         "p2": [
-          507.17,
-          300.04,
+          468.12,
+          699.78,
           210.0
         ]
       }
@@ -79,28 +79,28 @@
     "segments": [
       {
         "conexiune_id": 1,
-        "length_px": 233.62,
-        "length_2d_px": 215.01,
+        "length_px": 618.58,
+        "length_2d_px": 611.71,
         "p1": [
-          507.17,
-          300.04,
+          468.12,
+          699.78,
           210.0
         ],
         "p2": [
-          537.85,
-          512.85,
-          301.36
+          131.81,
+          188.81,
+          301.94
         ]
       }
     ],
-    "total_length_px": 233.62,
+    "total_length_px": 618.58,
     "count": 1,
     "unitate": "pixeli (lungime 3D)"
   },
   "render_meta": {
-    "z_gutter": 301.36,
+    "z_gutter": 301.94,
     "roof_angle_deg": 30.0,
-    "overhang_px": 60.17102708114595,
+    "overhang_px": 85.77077007932249,
     "wall_height": 300.0
   }
 }

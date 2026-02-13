@@ -44,44 +44,58 @@ def _polygon_perimeter_2d(poly_2d: List[Tuple[float, float]]) -> float:
     return p
 
 
+def _cross3(a: List[float], b: List[float]) -> List[float]:
+    """Produs vectorial a × b."""
+    return [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+
+
+def _norm(v: List[float]) -> float:
+    return math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
+
+
+def _normalize(v: List[float]) -> List[float]:
+    n = _norm(v)
+    if n < 1e-9:
+        return v
+    return [v[0] / n, v[1] / n, v[2] / n]
+
+
 def _unfold_face_to_2d(face_3d: List[List[float]]) -> Optional[Tuple[List[Tuple[float, float]], float, float]]:
     """
-    Proiectează o față plană 3D în 2D (unfold).
-    Returnează (polygon_2d, width, height) unde dimensiunile sunt în pixeli (aceeași scală ca planul).
+    Unfold: pune fața plat pe masă, păstrând dimensiunile reale 3D.
+    Cadru local: e1 = prima muchie, e2 = ultima muchie din V0 (V[-1]-V0).
+    normal = cross(e1,e2), u_axis = e1/|e1|, v_axis = cross(normal, u_axis).
+    Proiecție: (u,v) = dot(P-V0, u_axis), dot(P-V0, v_axis).
     """
     if len(face_3d) < 3:
         return None
     pts = [[float(p[0]), float(p[1]), float(p[2])] for p in face_3d]
-    # Alegem origine = primul punct, u = direcția primei muchii, v = normală în plan
     p0 = pts[0]
     p1 = pts[1]
-    u_vec = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]]
-    u_len = math.sqrt(u_vec[0] ** 2 + u_vec[1] ** 2 + u_vec[2] ** 2)
-    if u_len < 1e-9:
+    p_last = pts[-1]
+    e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]]
+    e2 = [p_last[0] - p0[0], p_last[1] - p0[1], p_last[2] - p0[2]]
+    normal = _cross3(e1, e2)
+    n_len = _norm(normal)
+    if n_len < 1e-9:
         return None
-    u_vec = [u_vec[0] / u_len, u_vec[1] / u_len, u_vec[2] / u_len]
-
-    # v = perpendicular pe u, în planul feței (folosim a doua muchie)
-    p2 = pts[2] if len(pts) > 2 else pts[0]
-    edge2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]]
-    # v = edge2 - (edge2·u)u
-    dot = edge2[0] * u_vec[0] + edge2[1] * u_vec[1] + edge2[2] * u_vec[2]
-    v_vec = [
-        edge2[0] - dot * u_vec[0],
-        edge2[1] - dot * u_vec[1],
-        edge2[2] - dot * u_vec[2],
-    ]
-    v_len = math.sqrt(v_vec[0] ** 2 + v_vec[1] ** 2 + v_vec[2] ** 2)
+    normal = _normalize(normal)
+    u_axis = _normalize(e1)
+    v_vec = _cross3(normal, u_axis)
+    v_len = _norm(v_vec)
     if v_len < 1e-9:
-        v_vec = [0.0, 0.0, 0.0]
-    else:
-        v_vec = [v_vec[0] / v_len, v_vec[1] / v_len, v_vec[2] / v_len]
+        return None
+    v_axis = _normalize(v_vec)
 
     poly_2d: List[Tuple[float, float]] = []
     for p in pts:
-        r = [p[0] - p0[0], p[1] - p0[1], p[2] - p0[2]]
-        u_val = r[0] * u_vec[0] + r[1] * u_vec[1] + r[2] * u_vec[2]
-        v_val = r[0] * v_vec[0] + r[1] * v_vec[1] + r[2] * v_vec[2]
+        d = [p[0] - p0[0], p[1] - p0[1], p[2] - p0[2]]
+        u_val = d[0] * u_axis[0] + d[1] * u_axis[1] + d[2] * u_axis[2]
+        v_val = d[0] * v_axis[0] + d[1] * v_axis[1] + d[2] * v_axis[2]
         poly_2d.append((u_val, v_val))
 
     xs = [pt[0] for pt in poly_2d]
@@ -103,23 +117,19 @@ def _rasterize_polygon_to_mask(
     height: float,
 ) -> Tuple[np.ndarray, int, int]:
     """
-    Rasterizează poligonul 2D într-o mască.
-    Dimensiunile măștii = ceil(width) x ceil(height) px – 1 px = 1 unitate din plan.
+    Rasterizează poligonul 2D într-o mască. Mapare 1:1 (1 px = 1 unitate), fără scalare,
+    pentru a păstra forma geometrică exactă.
     """
     w_px = max(1, int(math.ceil(width)))
     h_px = max(1, int(math.ceil(height)))
     mask = np.zeros((h_px, w_px), dtype=np.uint8)
-    # Translatăm poligonul astfel încât (min_u, min_v) -> (0, 0)
     xs = [p[0] for p in poly_2d]
     ys = [p[1] for p in poly_2d]
     min_u, min_v = min(xs), min(ys)
-    coords = np.array(
-        [[(p[0] - min_u), (p[1] - min_v)] for p in poly_2d],
-        dtype=np.float32,
+    pts_int = np.array(
+        [[int(round(p[0] - min_u)), int(round(p[1] - min_v))] for p in poly_2d],
+        dtype=np.int32,
     )
-    coords[:, 0] *= (w_px - 1) / max(width, 1e-6)
-    coords[:, 1] *= (h_px - 1) / max(height, 1e-6)
-    pts_int = np.array(coords, dtype=np.int32)
     if pts_int.size >= 6:
         cv2.fillPoly(mask, [pts_int], 255)
     return mask, w_px, h_px
@@ -156,6 +166,49 @@ def _face_centroid(verts: List[List[float]]) -> Tuple[float, float, float]:
     cy = sum(float(p[1]) for p in verts) / n
     cz = sum(float(p[2]) for p in verts) / n
     return (cx, cy, cz)
+
+
+def generate_unfold_masks_for_roof_types(
+    faces_data: List[Dict[str, Any]],
+    plan_h: int,
+    plan_w: int,
+    output_dir: Path,
+) -> int:
+    """
+    Generează măști unfold pentru fețele din roof_types.
+    Fiecare PNG are dimensiunea planului (plan_h x plan_w), fundal negru, mască albă.
+    Forma unfolded e desenată la scară 1:1 (1 px = 1 unitate), centrată pe centroidul
+    footprint-ului feței, astfel încât să corespundă cu poziția pe plan.
+    Output: unfold/{face_num}.png (face_num = 1, 2, 3, ... conform faces.png).
+    """
+    if cv2 is None:
+        return 0
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for face_idx, face in enumerate(faces_data, start=1):
+        verts = face.get("vertices_3d", [])
+        if len(verts) < 3:
+            continue
+        res = _unfold_face_to_2d(verts)
+        if res is None:
+            continue
+        poly_2d, _width, _height = res
+        cx, cy, _ = _face_centroid(verts)
+        cu = sum(p[0] for p in poly_2d) / len(poly_2d)
+        cv = sum(p[1] for p in poly_2d) / len(poly_2d)
+        pts_plan = np.array(
+            [[p[0] - cu + cx, p[1] - cv + cy] for p in poly_2d],
+            dtype=np.float32,
+        )
+        pts_int = np.round(pts_plan).astype(np.int32)
+        canvas = np.zeros((plan_h, plan_w), dtype=np.uint8)
+        if pts_int.size >= 6:
+            cv2.fillPoly(canvas, [pts_int], 255)
+        png_path = output_dir / f"{face_idx}.png"
+        cv2.imwrite(str(png_path), canvas)
+        count += 1
+    return count
 
 
 def _face_to_triangles(verts: List[List[float]]) -> List[List[List[float]]]:

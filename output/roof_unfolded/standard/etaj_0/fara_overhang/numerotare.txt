@@ -2,7 +2,3 @@
 # ----- | -------- | ----------------- | ------------------------------
 1 | sec0_fata1 | fata_1_sec0_fata1.png | fata_1_sec0_fata1_overlay.png
 2 | sec0_fata2 | fata_2_sec0_fata2.png | fata_2_sec0_fata2_overlay.png
-3 | sec1_fata1 | fata_3_sec1_fata1.png | fata_3_sec1_fata1_overlay.png
-4 | sec1_fata2 | fata_4_sec1_fata2.png | fata_4_sec1_fata2_overlay.png
-5 | sec2_fata1 | fata_5_sec2_fata1.png | fata_5_sec2_fata1_overlay.png
-6 | sec2_fata2 | fata_6_sec2_fata2.png | fata_6_sec2_fata2_overlay.png

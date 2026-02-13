@@ -1,13 +1,13 @@
 {
   "face_id": 6,
   "label": "sec0_piramida_6",
-  "width_units": 375.17,
-  "height_units": 308.5,
-  "area_units_sq": 58280.0,
-  "width_px": 376,
-  "height_px": 309,
-  "plan_h": 3115,
-  "plan_w": 2918,
+  "width_units": 538.97,
+  "height_units": 477.5,
+  "area_units_sq": 129090.0,
+  "width_px": 539,
+  "height_px": 478,
+  "plan_h": 1808,
+  "plan_w": 1233,
   "units": "pixels (same as input plan)",
   "scale": "1 px in image = 1 unit in 3D (true unfolded dimensions)"
 }

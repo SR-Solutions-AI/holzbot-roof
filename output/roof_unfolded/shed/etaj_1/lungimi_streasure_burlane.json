@@ -3,18 +3,18 @@
     "segments": [
       {
         "segment_id": 1,
-        "length_px": 1035.0,
+        "length_px": 955.0,
         "p1": [
-          1580.0,
-          1134.0
+          1097.0,
+          1624.0
         ],
         "p2": [
-          545.0,
-          1134.0
+          142.0,
+          1624.0
         ]
       }
     ],
-    "total_length_px": 1035.0,
+    "total_length_px": 955.0,
     "unitate": "pixeli (raportate la planul din care se face acoperișul)"
   },
   "burlane": {
@@ -24,13 +24,13 @@
         "length_px": 210.0,
         "length_3d_px": 210.0,
         "p1": [
-          507.17,
-          300.04,
+          468.12,
+          699.78,
           0.0
         ],
         "p2": [
-          507.17,
-          300.04,
+          468.12,
+          699.78,
           210.0
         ]
       }
@@ -43,28 +43,28 @@
     "segments": [
       {
         "conexiune_id": 1,
-        "length_px": 849.84,
-        "length_2d_px": 844.91,
+        "length_px": 997.92,
+        "length_2d_px": 993.67,
         "p1": [
-          507.17,
-          300.04,
+          468.12,
+          699.78,
           210.0
         ],
         "p2": [
-          545.0,
-          1144.11,
-          301.36
+          142.0,
+          1638.41,
+          301.94
         ]
       }
     ],
-    "total_length_px": 849.84,
+    "total_length_px": 997.92,
     "count": 1,
     "unitate": "pixeli (lungime 3D)"
   },
   "render_meta": {
-    "z_gutter": 301.36,
+    "z_gutter": 301.94,
     "roof_angle_deg": 30.0,
-    "overhang_px": 60.17102708114595,
+    "overhang_px": 85.77077007932249,
     "wall_height": 300.0
   }
 }

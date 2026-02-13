@@ -1,0 +1,19 @@
+# ID_pixel = nume_față
+1	sec0_panta1
+2	sec0_panta2
+3	sec0_piramida_left_tri1
+4	sec0_piramida_left_tri2
+5	sec0_piramida_right_tri1
+6	sec0_piramida_right_tri2
+7	sec1_panta1
+8	sec1_panta2
+9	sec1_piramida_top_tri1
+10	sec1_piramida_top_tri2
+11	sec1_piramida_bottom_tri1
+12	sec1_piramida_bottom_tri2
+13	sec2_panta1
+14	sec2_panta2
+15	sec2_piramida_top_tri1
+16	sec2_piramida_top_tri2
+17	sec2_piramida_bottom_tri1
+18	sec2_piramida_bottom_tri2

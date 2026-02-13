@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -152,7 +152,10 @@ def _clip_pyramid_faces_with_polygon(
                 tri_poly = ShapelyPolygon(xy)
             except Exception:
                 continue
-            inter = tri_poly.intersection(clip_poly)
+            try:
+                inter = tri_poly.intersection(clip_poly)
+            except Exception:
+                continue
             if inter is None or inter.is_empty:
                 continue
             geoms = getattr(inter, "geoms", [inter])
@@ -667,8 +670,25 @@ def _write_schematic_3d(
     if output_path:
         try:
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-            fig.write_image(output_path, width=1200 * n, height=900, scale=2)
-            ok = True
+            import threading
+            _result, _exc = [None], [None]
+
+            def _write():
+                try:
+                    fig.write_image(output_path, width=1200 * n, height=900, scale=2)
+                    _result[0] = True
+                except Exception as e:
+                    _exc[0] = e
+
+            t = threading.Thread(target=_write, daemon=True)
+            t.start()
+            t.join(timeout=90)
+            if t.is_alive():
+                logger.warning("Schematic PNG timed out (90s), skipping")
+            elif _exc[0]:
+                logger.warning("Schematic PNG failed: %s", _exc[0])
+            elif _result[0]:
+                ok = True
         except Exception as e:
             logger.warning("Schematic PNG failed: %s", e)
     return ok
@@ -706,8 +726,13 @@ def visualize_3d_standard_plotly(
     import roof_calc.roof_faces_3d as rf
     from roof_calc.overhang import (
         apply_overhang_to_sections,
+        clip_roof_faces_to_polygon,
         compute_overhang_sides_from_footprint,
         compute_overhang_sides_from_union_boundary,
+        extend_sections_to_connect,
+        extend_secondary_sections_to_main_ridge,
+        get_faces_3d_aframe_with_magenta,
+        ridge_intersection_corner_lines,
         get_drip_edge_faces_3d,
         get_downspout_faces_for_floors,
         get_downspout_faces_pyramid,
@@ -768,25 +793,31 @@ def visualize_3d_standard_plotly(
         return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
 
     def _compute_offsets(paths: List[str], results: List[Dict[str, Any]]) -> Dict[str, Tuple[int, int]]:
-        """Pixel-perfect: referință și centre întregi (aliniere cu floors_overlay)."""
-        bboxes: List[Tuple[int, int, int, int]] = []
-        for rr in results:
-            bb = _largest_section_bbox(rr) or (0, 0, 0, 0)
-            bboxes.append(bb)
-        widths = [b[2] - b[0] for b in bboxes]
-        heights = [b[3] - b[1] for b in bboxes]
-        max_w = max(widths) if widths else 0
-        max_h = max(heights) if heights else 0
-        padding = 50
-        ref_cx = int(round((max_w + 2 * padding) / 2))
-        ref_cy = int(round((max_h + 2 * padding) / 2))
+        """Etaje cu aceeași mărime și formă se pun unul peste altul: aliniem centrele (centroid poligon)."""
+        polys = [_polygon_from_path(p) for p in paths]
+        best_idx = 0
+        best_area = -1.0
+        for i, poly in enumerate(polys):
+            if poly is not None and not getattr(poly, "is_empty", True):
+                a = float(getattr(poly, "area", 0) or 0)
+                if a > best_area:
+                    best_area = a
+                    best_idx = i
+        ref_poly = polys[best_idx] if best_idx < len(polys) else None
+        if ref_poly is None or getattr(ref_poly, "is_empty", True):
+            cx_ref, cy_ref = 0.0, 0.0
+        else:
+            c = ref_poly.centroid
+            cx_ref, cy_ref = float(c.x), float(c.y)
         out: Dict[str, Tuple[int, int]] = {}
-        for p, bb in zip(paths, bboxes):
-            cx = (bb[0] + bb[2]) // 2
-            cy = (bb[1] + bb[3]) // 2
-            ox = ref_cx - cx
-            oy = ref_cy - cy
-            out[p] = (ox, oy)
+        for p, poly in zip(paths, polys):
+            if poly is None or getattr(poly, "is_empty", True):
+                out[p] = (int(round(-cx_ref)), int(round(-cy_ref)))
+            else:
+                c = poly.centroid
+                ox = int(round(cx_ref - c.x))
+                oy = int(round(cy_ref - c.y))
+                out[p] = (ox, oy)
         return out
 
     def _translate_sections(secs: List[Dict[str, Any]], dx: float, dy: float) -> List[Dict[str, Any]]:
@@ -847,6 +878,7 @@ def visualize_3d_standard_plotly(
 
     # Pre-compute roof faces for lower floors (roof_levels) pentru prelungirea pereților
     roof_faces_by_floor: Dict[int, List[Dict[str, Any]]] = {}
+    roof_faces_base_by_floor: Dict[int, List[Dict[str, Any]]] = {}
     use_shed_lower = lower_floor_roof_mode == "shed"
     if roof_levels:
         try:
@@ -855,9 +887,36 @@ def visualize_3d_standard_plotly(
                 from roof_calc.overhang import high_side_for_shed_from_upper_floor
             for z_base, roof_data, dx, dy, _fl in roof_levels:
                 fl = int(_fl) if _fl is not None else 0
+                footprint_fl = floors_payload[fl][1] if 0 <= fl < len(floors_payload) else None
                 secs0 = roof_data.get("sections") or []
                 conns0 = roof_data.get("connections") or []
                 secs_t = _translate_sections(secs0, float(dx), float(dy))
+                secs_t = extend_sections_to_connect(secs_t, conns0) if (secs_t and conns0) else secs_t
+                if secs_t and not use_shed_lower:
+                    secs_t = extend_secondary_sections_to_main_ridge(secs_t)
+                # Base (fără overhang) pentru cliparea pereților
+                if use_shed_lower:
+                    union_upper = None
+                    if 0 <= fl < len(floors_payload):
+                        polys_above = [floors_payload[i][1] for i in range(fl + 1, len(floors_payload))]
+                        if polys_above:
+                            union_upper = unary_union(polys_above)
+                    high_sides = high_side_for_shed_from_upper_floor(secs_t, union_upper)
+                    faces_base_fl = []
+                    roof_angle_rad = np.radians(roof_angle_deg)
+                    for s_idx, sec in enumerate(secs_t):
+                        hs = high_sides[s_idx] if s_idx < len(high_sides) else "top"
+                        for face in _roof_section_faces_shed(sec, float(z_base), roof_angle_rad, hs):
+                            faces_base_fl.append({"vertices_3d": face})
+                else:
+                    cl_base = ridge_intersection_corner_lines(secs_t)
+                    faces_base_fl = get_faces_3d_aframe_with_magenta(
+                        secs_t, conns0, roof_angle_deg=roof_angle_deg, wall_height=float(z_base),
+                        corner_lines=cl_base, floor_polygon=footprint_fl,
+                    )
+                if footprint_fl is not None:
+                    faces_base_fl = clip_roof_faces_to_polygon(faces_base_fl, footprint_fl)
+                roof_faces_base_by_floor[fl] = faces_base_fl
                 if overhang_px > 0 and secs_t:
                     footprint = floors_payload[fl][1] if 0 <= fl < len(floors_payload) else None
                     free = (
@@ -887,6 +946,8 @@ def visualize_3d_standard_plotly(
                     for f in faces:
                         vs = f.get("vertices_3d") or []
                         f["vertices_3d"] = [[float(x), float(y), float(z) - dz] for x, y, z in vs]
+                if faces and footprint_fl is not None:
+                    faces = clip_roof_faces_to_polygon(faces, footprint_fl)
                 roof_faces_by_floor[fl] = faces
         except Exception:
             pass
@@ -943,18 +1004,41 @@ def visualize_3d_standard_plotly(
 
         conns_kept = _filter_connections_by_sections(conns, keep_ids)
         # Top-floor roof only; lower floors come from `roof_levels` (remaining areas)
-        draw_roof = floor_idx == (num_floors - 1)
+        draw_roof = True
+        kept_extended = extend_sections_to_connect(kept, conns_kept) if (draw_roof and kept and conns_kept) else kept
+        if draw_roof and kept_extended:
+            kept_extended = extend_secondary_sections_to_main_ridge(kept_extended)
+        corner_lines_base = ridge_intersection_corner_lines(kept_extended, floor_polygon=floor_poly) if draw_roof and kept_extended else []
         roof_faces_base = (
-            rf.get_faces_3d_standard(kept, conns_kept, roof_angle_deg=roof_angle_deg, wall_height=z1) if draw_roof else []
+            get_faces_3d_aframe_with_magenta(
+                kept_extended, conns_kept, roof_angle_deg=roof_angle_deg, wall_height=z1,
+                corner_lines=corner_lines_base, floor_polygon=floor_poly,
+            )
+            if draw_roof and kept_extended
+            else []
         )
 
-        kept_use = kept
-        if draw_roof and overhang_px > 0 and kept:
-            free = compute_overhang_sides_from_union_boundary(kept)
-            kept_use = apply_overhang_to_sections(kept, overhang_px=overhang_px, free_sides=free)
+        kept_use = kept_extended
+        if draw_roof and overhang_px > 0 and kept_extended:
+            free = (
+                compute_overhang_sides_from_footprint(kept_extended, floor_poly)
+                if floor_poly is not None and not getattr(floor_poly, "is_empty", True)
+                else compute_overhang_sides_from_union_boundary(kept_extended)
+            )
+            kept_use = apply_overhang_to_sections(kept_extended, overhang_px=overhang_px, free_sides=free)
+        corner_lines_use = ridge_intersection_corner_lines(kept_use, floor_polygon=floor_poly) if draw_roof and kept_use else []
         roof_faces = (
-            rf.get_faces_3d_standard(kept_use, conns_kept, roof_angle_deg=roof_angle_deg, wall_height=z1) if draw_roof else []
+            get_faces_3d_aframe_with_magenta(
+                kept_use, conns_kept, roof_angle_deg=roof_angle_deg, wall_height=z1,
+                corner_lines=corner_lines_use, floor_polygon=floor_poly,
+            )
+            if draw_roof and kept_use
+            else []
         )
+        if roof_faces and floor_poly is not None:
+            roof_faces = clip_roof_faces_to_polygon(roof_faces, floor_poly)
+        if roof_faces_base and floor_poly is not None:
+            roof_faces_base = clip_roof_faces_to_polygon(roof_faces_base, floor_poly)
 
         if overhang_px > 0 and overhang_shift_whole_roof_down and roof_faces:
             try:
@@ -1074,23 +1158,28 @@ def visualize_3d_standard_plotly(
             except Exception:
                 pass
 
-        # Pereți: prelungim până la acoperiș (etaj superior sau roof_levels)
-        # Formăm forma geometrică: segment perete + contur acoperiș de-a lungul peretelui
+        # Pereți: clipăm la outline-ul acoperișului FĂRĂ overhang – nu depășim niciodată
         faces_for_wall_z = (
-            roof_faces if (draw_roof and roof_faces) else roof_faces_by_floor.get(floor_idx, [])
+            roof_faces_base if (draw_roof and roof_faces_base) else roof_faces_base_by_floor.get(floor_idx, [])
         )
+        if not faces_for_wall_z and (draw_roof and roof_faces):
+            faces_for_wall_z = roof_faces
+        if not faces_for_wall_z:
+            faces_for_wall_z = roof_faces_by_floor.get(floor_idx, [])
         for i in range(len(floor_coords) - 1):
             p1, p2 = floor_coords[i], floor_coords[i + 1]
             x1, y1 = float(p1[0]), float(p1[1])
             x2, y2 = float(p2[0]), float(p2[1])
             if faces_for_wall_z:
-                # Eșantionăm 5 puncte de-a lungul peretelui pentru a urmări panta acoperișului
+                # Pereți: min(z1, zt) – taiem orice bucată care iese peste outline-ul acoperișului
+                n_pts = 13
                 pts_top = []
-                for t in (0.0, 0.25, 0.5, 0.75, 1.0):
+                for k in range(n_pts):
+                    t = k / (n_pts - 1) if n_pts > 1 else 1.0
                     x = x1 + t * (x2 - x1)
                     y = y1 + t * (y2 - y1)
-                    zt = _z_roof_at(faces_for_wall_z, x, y, z1)
-                    pts_top.append([x, y, max(z1, zt)])
+                    zt = _z_roof_at(faces_for_wall_z, x, y, z1, tol=40.0)
+                    pts_top.append([x, y, min(z1, zt)])
                 # Poligon: jos (p1,p2), sus invers (de la p2 la p1 pe conturul acoperișului)
                 face_pts = [[x1, y1, z0], [x2, y2, z0]] + [list(p) for p in reversed(pts_top)]
                 for tri in _triangulate_fan(face_pts):
@@ -1176,6 +1265,8 @@ def visualize_3d_standard_plotly(
     if roof_levels:
         try:
             for z_base, roof_data, dx, dy, _fl in roof_levels:
+                fl_idx = int(_fl) if _fl is not None else 0
+                footprint_fl = floors_payload[fl_idx][1] if 0 <= fl_idx < len(floors_payload) else None
                 secs0 = roof_data.get("sections") or []
                 conns0 = roof_data.get("connections") or []
                 secs_t = _translate_sections(secs0, float(dx), float(dy))
@@ -1265,9 +1356,17 @@ def visualize_3d_standard_plotly(
                         for _ in range(len(ep) // 2):
                             gutter_segment_sections.append(secs_t)
                 else:
-                    faces = rf.get_faces_3d_standard(secs_t, conns0, roof_angle_deg=roof_angle_deg, wall_height=float(z_base))
+                    cl_af = ridge_intersection_corner_lines(secs_t)
+                    faces = get_faces_3d_aframe_with_magenta(
+                        secs_t, conns0, roof_angle_deg=roof_angle_deg, wall_height=float(z_base),
+                        corner_lines=cl_af, floor_polygon=footprint_fl,
+                    )
                     if overhang_px > 0 and secs_t_no_oh:
-                        faces_base_af = rf.get_faces_3d_standard(secs_t_no_oh, conns0, roof_angle_deg=roof_angle_deg, wall_height=float(z_base))
+                        cl_af_base = ridge_intersection_corner_lines(secs_t_no_oh)
+                        faces_base_af = get_faces_3d_aframe_with_magenta(
+                            secs_t_no_oh, conns0, roof_angle_deg=roof_angle_deg, wall_height=float(z_base),
+                            corner_lines=cl_af_base, floor_polygon=footprint_fl,
+                        )
                         for f in faces_base_af:
                             verts = f.get("vertices_3d")
                             if verts:
@@ -1737,25 +1836,31 @@ def visualize_3d_pyramid_plotly(
         return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
 
     def _compute_offsets(paths: List[str], results: List[Dict[str, Any]]) -> Dict[str, Tuple[int, int]]:
-        """Pixel-perfect: referință și centre întregi (aliniere cu floors_overlay)."""
-        bboxes: List[Tuple[int, int, int, int]] = []
-        for rr in results:
-            bb = _largest_section_bbox(rr) or (0, 0, 0, 0)
-            bboxes.append(bb)
-        widths = [b[2] - b[0] for b in bboxes]
-        heights = [b[3] - b[1] for b in bboxes]
-        max_w = max(widths) if widths else 0
-        max_h = max(heights) if heights else 0
-        padding = 50
-        ref_cx = int(round((max_w + 2 * padding) / 2))
-        ref_cy = int(round((max_h + 2 * padding) / 2))
+        """Etaje cu aceeași mărime și formă se pun unul peste altul: aliniem centrele (centroid poligon)."""
+        polys = [_polygon_from_path(p) for p in paths]
+        best_idx = 0
+        best_area = -1.0
+        for i, poly in enumerate(polys):
+            if poly is not None and not getattr(poly, "is_empty", True):
+                a = float(getattr(poly, "area", 0) or 0)
+                if a > best_area:
+                    best_area = a
+                    best_idx = i
+        ref_poly = polys[best_idx] if best_idx < len(polys) else None
+        if ref_poly is None or getattr(ref_poly, "is_empty", True):
+            cx_ref, cy_ref = 0.0, 0.0
+        else:
+            c = ref_poly.centroid
+            cx_ref, cy_ref = float(c.x), float(c.y)
         out: Dict[str, Tuple[int, int]] = {}
-        for p, bb in zip(paths, bboxes):
-            cx = (bb[0] + bb[2]) // 2
-            cy = (bb[1] + bb[3]) // 2
-            ox = ref_cx - cx
-            oy = ref_cy - cy
-            out[p] = (ox, oy)
+        for p, poly in zip(paths, polys):
+            if poly is None or getattr(poly, "is_empty", True):
+                out[p] = (int(round(-cx_ref)), int(round(-cy_ref)))
+            else:
+                c = poly.centroid
+                ox = int(round(cx_ref - c.x))
+                oy = int(round(cy_ref - c.y))
+                out[p] = (ox, oy)
         return out
 
     def _translate_sections(secs: List[Dict[str, Any]], dx: float, dy: float) -> List[Dict[str, Any]]:
@@ -1862,7 +1967,7 @@ def visualize_3d_pyramid_plotly(
             upper_secs_all.extend(_translate_sections(rr_u.get("sections") or [], dxu, dyu))
 
         # Top-floor roof: draw directly. Lower floors: via roof_levels (same as standard)
-        draw_roof = floor_idx == (num_floors - 1)
+        draw_roof = True
 
         secs_base = rr.get("sections") or []
         conns = rr.get("connections") or []
@@ -2027,21 +2132,44 @@ def visualize_3d_pyramid_plotly(
                     ys_all.append(float(vy))
             section_face_data.append((color_hex, faces_oh))
 
-        # Pereți prelungiți până la acoperiș (piramidă)
-        faces_for_wall_z = [{"vertices_3d": f} for faces in [d[1] for d in section_face_data] for f in faces]
+        # Pereți: clipăm la outline-ul acoperișului FĂRĂ overhang (piramidă)
+        pyramid_faces_base: List[Dict[str, Any]] = []
+        if draw_roof and secs_base:
+            for s_idx, sec0 in enumerate(secs_base):
+                br0 = sec0.get("bounding_rect") or []
+                if len(br0) < 3:
+                    continue
+                sec0_t = {
+                    **sec0,
+                    "bounding_rect": [(float(p[0]) + ox, float(p[1]) + oy) for p in br0],
+                    "ridge_line": [(float(p[0]) + ox, float(p[1]) + oy) for p in (sec0.get("ridge_line") or [])],
+                }
+                fe = free_ends[s_idx] if s_idx < len(free_ends) else {}
+                faces_base_pyr = _roof_section_faces_pyramid(sec0_t, z1, roof_angle_rad, fe, upper_secs_all)
+                for f in (faces_base_pyr or []):
+                    pyramid_faces_base.append({"vertices_3d": f})
+        faces_for_wall_z = pyramid_faces_base if pyramid_faces_base else [{"vertices_3d": f} for faces in [d[1] for d in section_face_data] for f in faces]
         for i in range(len(coords) - 1):
             p1, p2 = coords[i], coords[i + 1]
+            x1, y1 = float(p1[0]), float(p1[1])
+            x2, y2 = float(p2[0]), float(p2[1])
             if draw_roof and faces_for_wall_z:
-                z1_top = _z_roof_at(faces_for_wall_z, float(p1[0]), float(p1[1]), z1)
-                z2_top = _z_roof_at(faces_for_wall_z, float(p2[0]), float(p2[1]), z1)
-                z1_top = max(z1, z1_top)
-                z2_top = max(z1, z2_top)
+                n_pts = 13
+                pts_top = []
+                for k in range(n_pts):
+                    t = k / (n_pts - 1) if n_pts > 1 else 1.0
+                    x = x1 + t * (x2 - x1)
+                    y = y1 + t * (y2 - y1)
+                    zt = _z_roof_at(faces_for_wall_z, x, y, z1, tol=40.0)
+                    pts_top.append([x, y, min(z1, zt)])
+                face_pts = [[x1, y1, z0], [x2, y2, z0]] + [list(p) for p in reversed(pts_top)]
+                for tri in _triangulate_fan(face_pts):
+                    add_face(tri, gray)
             else:
-                z1_top = z2_top = z1
-            add_face(
-                [[p1[0], p1[1], z0], [p2[0], p2[1], z0], [p2[0], p2[1], z2_top], [p1[0], p1[1], z1_top]],
-                gray,
-            )
+                add_face(
+                    [[x1, y1, z0], [x2, y2, z0], [x2, y2, z1], [x1, y1, z1]],
+                    gray,
+                )
 
         for _color, faces in section_face_data:
             for f in faces:
@@ -2488,5 +2616,1233 @@ def visualize_3d_pyramid_plotly(
             logger.warning("Plotly write_image failed (pyramid): %s", e)
 
     # Return True only if PNG was written (so caller can fallback to Matplotlib for PNG)
+    return ok_png if output_path else ok_html
+
+
+def visualize_3d_house_render_plotly(
+    output_path: str,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+    all_floor_paths: Optional[List[str]] = None,
+    floor_roof_results: Optional[List[Dict[str, Any]]] = None,
+    html_output_path: Optional[str] = None,
+    roof_levels: Optional[List[Tuple[float, Dict[str, Any], float, float, int]]] = None,
+    final_mode: bool = False,
+    extend_segments_mode: bool = False,
+) -> bool:
+    """
+    Randare 3D house_render: pereți + linii 3D (magenta, ridge, verde contur) + fețe acoperiș.
+    final_mode: acoperiș caramiziu, drip, burlane.
+    extend_segments_mode: segmentele acoperișului sunt prelungite la capete în direcția lor (altă culoare).
+    """
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except Exception:
+        return False
+
+    import math
+    import cv2
+    from shapely.geometry import Point as ShapelyPoint
+    from shapely.geometry import Polygon as ShapelyPolygon
+    from shapely.ops import unary_union
+    from shapely import affinity as shapely_affinity
+
+    from roof_calc.flood_fill import flood_fill_interior, get_house_shape_mask
+    from roof_calc.geometry import extract_polygon
+    from roof_calc.overhang import (
+        apply_overhang_to_sections,
+        clip_roof_faces_to_polygon,
+        compute_overhang_px_from_roof_results,
+        compute_overhang_sides_from_footprint,
+        compute_overhang_sides_from_union_boundary,
+        extend_sections_to_connect,
+        extend_secondary_sections_to_main_ridge,
+        get_drip_edge_faces_3d,
+        get_downspout_faces_for_floors,
+        get_faces_3d_aframe_with_magenta,
+        get_gutter_centerlines_3d,
+        get_gutter_end_closures_3d,
+        get_gutter_endpoints_3d,
+        get_gutter_faces_3d,
+        ridge_intersection_corner_lines,
+        _is_interior_corner,
+    )
+    from roof_calc.roof_segments_3d import get_faces_3d_from_segments, get_roof_segments_3d
+
+    if not all_floor_paths or not floor_roof_results or len(all_floor_paths) != len(floor_roof_results):
+        return False
+
+    def _polygon_from_path(path: str) -> Optional[Any]:
+        im = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if im is None:
+            return None
+        filled0 = flood_fill_interior(im)
+        house0 = get_house_shape_mask(filled0)
+        poly0 = extract_polygon(house0)
+        if poly0 is None or poly0.is_empty:
+            return None
+        return poly0
+
+    def _section_rect_center(sec: Dict[str, Any]) -> Tuple[float, float]:
+        br = sec.get("bounding_rect") or []
+        if len(br) < 3:
+            return (0.0, 0.0)
+        xs = [float(p[0]) for p in br]
+        ys = [float(p[1]) for p in br]
+        return ((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0)
+
+    def _section_area(sec: Dict[str, Any]) -> float:
+        br = sec.get("bounding_rect") or []
+        if len(br) < 3:
+            return 0.0
+        xs = [float(p[0]) for p in br]
+        ys = [float(p[1]) for p in br]
+        return (max(xs) - min(xs)) * (max(ys) - min(ys))
+
+    def _compute_offsets(paths: List[str], results: List[Dict[str, Any]]) -> Dict[str, Tuple[int, int]]:
+        polys = [_polygon_from_path(p) for p in paths]
+        best_idx = 0
+        best_area = -1.0
+        for i, poly in enumerate(polys):
+            if poly is not None and not getattr(poly, "is_empty", True):
+                a = float(getattr(poly, "area", 0) or 0)
+                if a > best_area:
+                    best_area = a
+                    best_idx = i
+        cx_ref, cy_ref = 0.0, 0.0
+        ref_path = paths[best_idx] if best_idx < len(paths) else paths[0]
+        if len(paths) >= 2 and len(results) >= 2:
+            rr_ref = results[best_idx]
+            secs_ref = rr_ref.get("sections") or []
+            for other_idx, (path_oth, rr_oth) in enumerate(zip(paths, results)):
+                if other_idx == best_idx:
+                    continue
+                secs_oth = rr_oth.get("sections") or []
+                for s_ref in secs_ref:
+                    a_ref = _section_area(s_ref)
+                    if a_ref <= 0:
+                        continue
+                    for s_oth in secs_oth:
+                        a_oth = _section_area(s_oth)
+                        if a_oth <= 0:
+                            continue
+                        if min(a_ref, a_oth) / max(a_ref, a_oth) >= 0.9:
+                            cx_ref, cy_ref = _section_rect_center(s_ref)
+                            break
+                    if cx_ref != 0 or cy_ref != 0:
+                        break
+                if cx_ref != 0 or cy_ref != 0:
+                    break
+        if cx_ref == 0 and cy_ref == 0:
+            ref_poly = polys[best_idx] if best_idx < len(polys) else None
+            if ref_poly and not getattr(ref_poly, "is_empty", True):
+                c = ref_poly.centroid
+                cx_ref, cy_ref = float(c.x), float(c.y)
+        out: Dict[str, Tuple[int, int]] = {}
+        for p, poly in zip(paths, polys):
+            if p == ref_path:
+                out[p] = (0, 0)
+                continue
+            found = False
+            if p in paths:
+                pi = paths.index(p)
+                if pi < len(results):
+                    rr_p = results[pi]
+                    rr_ref = results[best_idx] if best_idx < len(results) else None
+                    if rr_ref:
+                        for s_p in rr_p.get("sections") or []:
+                            a_p = _section_area(s_p)
+                            if a_p <= 0:
+                                continue
+                            for s_ref in rr_ref.get("sections") or []:
+                                a_ref = _section_area(s_ref)
+                                if a_ref <= 0:
+                                    continue
+                                if min(a_p, a_ref) / max(a_p, a_ref) >= 0.9:
+                                    cxi, cyi = _section_rect_center(s_p)
+                                    out[p] = (int(round(cx_ref - cxi)), int(round(cy_ref - cyi)))
+                                    found = True
+                                    break
+                            if found:
+                                break
+            if not found:
+                if poly is None or getattr(poly, "is_empty", True):
+                    out[p] = (int(round(-cx_ref)), int(round(-cy_ref)))
+                else:
+                    c = poly.centroid
+                    out[p] = (int(round(cx_ref - c.x)), int(round(cy_ref - c.y)))
+        return out
+
+    def _translate_sections(secs: List[Dict[str, Any]], dx: float, dy: float) -> List[Dict[str, Any]]:
+        out = []
+        for sec in secs:
+            rect = sec.get("bounding_rect", [])
+            ridge = sec.get("ridge_line", [])
+            out.append({
+                **sec,
+                "bounding_rect": [(float(p[0]) + dx, float(p[1]) + dy) for p in rect] if rect else [],
+                "ridge_line": [(float(p[0]) + dx, float(p[1]) + dy) for p in ridge] if ridge and len(ridge) >= 2 else [],
+            })
+        return out
+
+    def _filter_connections_by_sections(conns: List[Dict[str, Any]], keep_ids: set[int]) -> List[Dict[str, Any]]:
+        out = []
+        for c in conns or []:
+            ids = c.get("section_ids") or c.get("section_id") or []
+            try:
+                lst = ids if isinstance(ids, (list, tuple)) else [ids]
+                if all(int(x) in keep_ids for x in lst):
+                    out.append(c)
+            except Exception:
+                pass
+        return out
+
+    def _covered_by_upper(sec_poly: Any, union_above: Any, area_thresh: float = 500.0) -> bool:
+        if union_above is None or getattr(union_above, "is_empty", True):
+            return False
+        try:
+            rem = sec_poly.difference(union_above)
+            return float(getattr(rem, "area", 0.0) or 0.0) < area_thresh
+        except Exception:
+            return False
+
+    config = config or {}
+    roof_angle_deg = float(config.get("roof_angle", 30.0))
+    wall_height = float(config.get("wall_height", 300.0))
+    views = config.get("views", [{"elev": 30, "azim": 45, "title": "Sud-Est"}, {"elev": 20, "azim": 225, "title": "Nord-Vest"}])
+    overhang_px = float(config.get("overhang_px", 0.0))
+    if (final_mode or extend_segments_mode) and overhang_px <= 0:
+        overhang_px = compute_overhang_px_from_roof_results(floor_roof_results or [], ratio=0.10)
+
+    # Pereții din imaginile pereților (all_floor_paths) – acoperișurile se pun peste ei
+    offsets = _compute_offsets(all_floor_paths, floor_roof_results)
+    floors_payload: List[Tuple[str, Any, Dict[str, Any], Tuple[int, int], int]] = []
+    for idx, (p, rr) in enumerate(zip(all_floor_paths, floor_roof_results)):
+        poly0 = _polygon_from_path(p)
+        if poly0 is None:
+            continue
+        ox, oy = offsets.get(p, (0, 0))
+        poly_t = shapely_affinity.translate(poly0, xoff=ox, yoff=oy)
+        floors_payload.append((p, poly_t, rr, (ox, oy), idx))
+    if not floors_payload:
+        return False
+
+    # Sortare: aria descendentă, apoi index original ascendent – la arii egale, ultimul etaj (index mare) rămâne ultimul
+    floors_payload.sort(key=lambda t: (-(float(getattr(t[1], "area", 0.0) or 0.0)), t[4]))
+    num_floors = len(floors_payload)
+    z_max = num_floors * wall_height + 500
+    tan_angle = math.tan(math.radians(roof_angle_deg))
+
+    # Pentru final_mode: date top floor pentru drip/gutter
+    top_floor_for_final: Optional[Any] = None
+
+    # Încarcă fețe din a_faces – pentru fiecare etaj, exact ce e în a_faces.png (a_faces_faces.json)
+    a_faces_by_etaj: Dict[int, List[Dict[str, Any]]] = {}
+    a_lines_segments_by_etaj: Dict[int, Dict[str, Any]] = {}
+    try:
+        import json
+        import random
+        out_dir = Path(output_path).parent
+        for etaj_dir in sorted(out_dir.glob("etaj_*")):
+            if not etaj_dir.is_dir():
+                continue
+            try:
+                etaj_idx = int(etaj_dir.name.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+            faces_path = etaj_dir / "a_faces_faces.json"
+            if faces_path.exists():
+                data = json.loads(faces_path.read_text(encoding="utf-8"))
+                faces = data.get("faces", [])
+                if faces:
+                    a_faces_by_etaj[etaj_idx] = faces
+            seg_path = etaj_dir / "a_lines_segments.json"
+            if seg_path.exists():
+                try:
+                    seg_data = json.loads(seg_path.read_text(encoding="utf-8"))
+                    if seg_data:
+                        a_lines_segments_by_etaj[etaj_idx] = seg_data
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    def _ridge_z(sec: Dict[str, Any], base_z: float) -> float:
+        br = sec.get("bounding_rect", [])
+        if len(br) < 3:
+            return base_z
+        xs = [float(p[0]) for p in br]
+        ys = [float(p[1]) for p in br]
+        orient = str(sec.get("ridge_orientation", "horizontal"))
+        span = (max(ys) - min(ys)) / 2.0 if orient == "horizontal" else (max(xs) - min(xs)) / 2.0
+        return base_z + span * tan_angle
+
+    lx_magenta, ly_magenta, lz_magenta = [], [], []
+    lx_ridge, ly_ridge, lz_ridge = [], [], []
+    lx_aframe, ly_aframe, lz_aframe = [], [], []
+    lx_green, ly_green, lz_green = [], [], []
+    lx_ext, ly_ext, lz_ext = [], [], []
+    ext_outer_points: List[List[float]] = []
+    xs_all: List[float] = []
+    ys_all: List[float] = []
+    roof_faces_with_colors: List[Tuple[List[List[float]], str]] = []
+
+    for floor_idx, (_p, floor_poly, rr, (ox, oy), _orig_idx) in enumerate(floors_payload):
+        z0 = floor_idx * wall_height
+        z1 = (floor_idx + 1) * wall_height
+        coords = list(floor_poly.exterior.coords) if hasattr(floor_poly, "exterior") else []
+        for c in coords:
+            xs_all.append(float(c[0]))
+            ys_all.append(float(c[1]))
+
+        draw_roof = True
+        union_above = None
+        if floor_idx + 1 < len(floors_payload):
+            union_above = unary_union([fp[1] for fp in floors_payload[floor_idx + 1:]])
+        secs = rr.get("sections") or []
+        conns = rr.get("connections") or []
+        kept: List[Dict[str, Any]] = []
+        keep_ids: set[int] = set()
+        for sec in secs:
+            br = sec.get("bounding_rect", [])
+            if len(br) < 3:
+                continue
+            sp = ShapelyPolygon(br)
+            sp = shapely_affinity.translate(sp, xoff=ox, yoff=oy)
+            if _covered_by_upper(sp, union_above, area_thresh=500.0):
+                continue
+            sec_t = _translate_sections([sec], float(ox), float(oy))[0]
+            kept.append(sec_t)
+            try:
+                keep_ids.add(int(sec_t.get("section_id")))
+            except Exception:
+                pass
+        conns_kept = _filter_connections_by_sections(conns, keep_ids)
+        kept_extended = extend_sections_to_connect(kept, conns_kept) if (draw_roof and kept and conns_kept) else kept
+        if draw_roof and kept_extended:
+            kept_extended = extend_secondary_sections_to_main_ridge(kept_extended)
+
+        if draw_roof and kept_extended:
+            z_ridge_common = max(_ridge_z(sec, z1) for sec in kept_extended)
+            # Linii ridge/magenta/verde doar pentru etajul cu acoperiș (ultimul în ordinea ariei)
+            draw_lines_this_floor = (floor_idx == num_floors - 1)
+            a_lines_seg = a_lines_segments_by_etaj.get(_orig_idx) if (_orig_idx is not None and draw_lines_this_floor) else None
+            if a_lines_seg:
+                for seg in a_lines_seg.get("ridge") or []:
+                    if len(seg) >= 2:
+                        p1 = [float(seg[0][0]) + ox, float(seg[0][1]) + oy, z_ridge_common]
+                        p2 = [float(seg[1][0]) + ox, float(seg[1][1]) + oy, z_ridge_common]
+                        lx, ly, lz = _segment_to_plotly_line(p1, p2)
+                        lx_ridge.extend(lx)
+                        ly_ridge.extend(ly)
+                        lz_ridge.extend(lz)
+                for seg in a_lines_seg.get("magenta") or []:
+                    if len(seg) >= 2:
+                        p1 = [float(seg[0][0]) + ox, float(seg[0][1]) + oy, z_ridge_common]
+                        p2 = [float(seg[1][0]) + ox, float(seg[1][1]) + oy, z1]
+                        lx, ly, lz = _segment_to_plotly_line(p1, p2)
+                        lx_magenta.extend(lx)
+                        ly_magenta.extend(ly)
+                        lz_magenta.extend(lz)
+                for seg in a_lines_seg.get("contour") or []:
+                    if len(seg) >= 2:
+                        p1 = [float(seg[0][0]) + ox, float(seg[0][1]) + oy, z1]
+                        p2 = [float(seg[1][0]) + ox, float(seg[1][1]) + oy, z1]
+                        lx, ly, lz = _segment_to_plotly_line(p1, p2)
+                        lx_green.extend(lx)
+                        ly_green.extend(ly)
+                        lz_green.extend(lz)
+            else:
+                corner_lines = ridge_intersection_corner_lines(kept_extended, floor_polygon=floor_poly)
+                coords_ex = list(floor_poly.exterior.coords) if hasattr(floor_poly, "exterior") else []
+                corner_tol = 2.0
+                boundary_tol = 2.5
+
+                def _snap_to_boundary(cx: float, cy: float) -> Tuple[float, float]:
+                    """Întâi: dacă e colț la 1–2 px, mergi la colț. Altfel: cel mai apropiat punct pe contur."""
+                    if len(coords_ex) < 2:
+                        return (cx, cy)
+                    for i in range(len(coords_ex) - 1):
+                        vx, vy = float(coords_ex[i][0]), float(coords_ex[i][1])
+                        d2 = (cx - vx) ** 2 + (cy - vy) ** 2
+                        if d2 <= corner_tol * corner_tol:
+                            return (vx, vy)
+                    best_pt = (cx, cy)
+                    best_d2 = float("inf")
+                    for i in range(len(coords_ex) - 1):
+                        x1, y1 = float(coords_ex[i][0]), float(coords_ex[i][1])
+                        x2, y2 = float(coords_ex[i + 1][0]), float(coords_ex[i + 1][1])
+                        dx, dy = x2 - x1, y2 - y1
+                        L2 = dx * dx + dy * dy
+                        if L2 < 1e-12:
+                            t = 0.0
+                            nx, ny = x1, y1
+                        else:
+                            t = max(0, min(1, ((cx - x1) * dx + (cy - y1) * dy) / L2))
+                            nx, ny = x1 + t * dx, y1 + t * dy
+                        d2 = (cx - nx) ** 2 + (cy - ny) ** 2
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best_pt = (nx, ny)
+                    if best_d2 <= boundary_tol * boundary_tol:
+                        return best_pt
+                    return (cx, cy)
+
+                for item in corner_lines:
+                    pt = item[0]
+                    corners = item[1]
+                    ix, iy = float(pt[0]), float(pt[1])
+                    for cx, cy in corners:
+                        sx, sy = _snap_to_boundary(float(cx), float(cy))
+                        lx, ly, lz = _segment_to_plotly_line([ix, iy, z_ridge_common], [sx, sy, z1])
+                        lx_magenta.extend(lx)
+                        ly_magenta.extend(ly)
+                        lz_magenta.extend(lz)
+                drawn_from: set = set()
+
+                def _key(px: float, py: float) -> Tuple[int, int]:
+                    return (int(round(px / 5)), int(round(py / 5)))
+
+                def _already_drawn_from(px: float, py: float) -> bool:
+                    return _key(px, py) in drawn_from
+
+                def _mark_drawn(px: float, py: float) -> None:
+                    drawn_from.add(_key(px, py))
+
+                # Colțuri interioare = doar vârfuri concave ale poligonului streașină
+                interior_corner_pts: List[Tuple[float, float]] = []
+                for i in range(len(coords_ex)):
+                    curr = (float(coords_ex[i][0]), float(coords_ex[i][1]))
+                    prev = (float(coords_ex[i - 1][0]), float(coords_ex[i - 1][1])) if i > 0 else (float(coords_ex[-2][0]), float(coords_ex[-2][1]))
+                    next_p = (float(coords_ex[i + 1][0]), float(coords_ex[i + 1][1])) if i + 1 < len(coords_ex) else (float(coords_ex[1][0]), float(coords_ex[1][1]))
+                    if _is_interior_corner(prev, curr, next_p, floor_poly):
+                        interior_corner_pts.append(curr)
+                interior_keys = {(round(ix, 1), round(iy, 1)) for ix, iy in interior_corner_pts}
+
+                def _is_interior(cx: float, cy: float) -> bool:
+                    """Colț interior (concav) – excludem linii portocalii către el."""
+                    return (round(cx, 1), round(cy, 1)) in interior_keys
+
+                corners_by_rect: Dict[Tuple[float, float, float, float], List[Tuple[float, float]]] = {}
+                for item in corner_lines:
+                    corners = item[1]
+                    rect_key = item[2] if len(item) >= 3 else None
+                    if rect_key is not None:
+                        rk = (round(rect_key[0], 2), round(rect_key[1], 2), round(rect_key[2], 2), round(rect_key[3], 2))
+                        if rk not in corners_by_rect:
+                            corners_by_rect[rk] = []
+                        existing = {(round(x, 4), round(y, 4)) for x, y in corners_by_rect[rk]}
+                        for c in corners:
+                            k = (round(float(c[0]), 4), round(float(c[1]), 4))
+                            if k not in existing:
+                                existing.add(k)
+                                corners_by_rect[rk].append((float(c[0]), float(c[1])))
+
+                for sec in kept_extended:
+                    ridge = sec.get("ridge_line", [])
+                    br = sec.get("bounding_rect", [])
+                    if len(ridge) < 2 or len(br) < 3:
+                        continue
+                    xs = [float(p[0]) for p in br]
+                    ys = [float(p[1]) for p in br]
+                    minx, maxx = min(xs), max(xs)
+                    miny, maxy = min(ys), max(ys)
+                    orient = str(sec.get("ridge_orientation", "horizontal"))
+                    r0, r1 = ridge[0], ridge[1]
+                    p0 = [float(r0[0]), float(r0[1]), z_ridge_common]
+                    p1 = [float(r1[0]), float(r1[1]), z_ridge_common]
+                    rect_key = (round(minx, 2), round(miny, 2), round(maxx, 2), round(maxy, 2))
+                    mag_corners = corners_by_rect.get(rect_key, [])
+                    tl = (minx, maxy)
+                    tr = (maxx, maxy)
+                    bl = (minx, miny)
+                    br_pt = (maxx, miny)
+
+                    def _drop_interior_and_symmetric_opposite(corners: list) -> list:
+                        drop = {i for i, c in enumerate(corners) if _is_interior(*_snap_to_boundary(float(c[0]), float(c[1])))}
+                        n = len(corners)
+                        for i in list(drop):
+                            drop.add(n - 1 - i)
+                        return [c for i, c in enumerate(corners) if i not in drop]
+
+                    if orient == "horizontal":
+                        if float(r0[0]) <= float(r1[0]):
+                            left_end, right_end = p0, p1
+                        else:
+                            left_end, right_end = p1, p0
+                        if mag_corners:
+                            left_raw = [c for c in mag_corners if float(c[0]) < (minx + maxx) / 2]
+                            right_raw = [c for c in mag_corners if float(c[0]) >= (minx + maxx) / 2]
+                        else:
+                            left_raw, right_raw = [tl, bl], [tr, br_pt]
+                        left_corners = _drop_interior_and_symmetric_opposite(left_raw)
+                        right_corners = _drop_interior_and_symmetric_opposite(right_raw)
+                        if not _already_drawn_from(float(left_end[0]), float(left_end[1])) and left_corners and right_corners:
+                            for c in left_corners:
+                                sx, sy = _snap_to_boundary(float(c[0]), float(c[1]))
+                                lx, ly, lz = _segment_to_plotly_line(left_end, [sx, sy, z1])
+                                lx_aframe.extend(lx)
+                                ly_aframe.extend(ly)
+                                lz_aframe.extend(lz)
+                            _mark_drawn(float(left_end[0]), float(left_end[1]))
+                        if not _already_drawn_from(float(right_end[0]), float(right_end[1])) and left_corners and right_corners:
+                            for c in right_corners:
+                                sx, sy = _snap_to_boundary(float(c[0]), float(c[1]))
+                                lx, ly, lz = _segment_to_plotly_line(right_end, [sx, sy, z1])
+                                lx_aframe.extend(lx)
+                                ly_aframe.extend(ly)
+                                lz_aframe.extend(lz)
+                            _mark_drawn(float(right_end[0]), float(right_end[1]))
+                    else:
+                        if float(r0[1]) <= float(r1[1]):
+                            top_end, bottom_end = p0, p1
+                        else:
+                            top_end, bottom_end = p1, p0
+                        if mag_corners:
+                            top_raw = [c for c in mag_corners if float(c[1]) < (miny + maxy) / 2]
+                            bottom_raw = [c for c in mag_corners if float(c[1]) >= (miny + maxy) / 2]
+                        else:
+                            top_raw, bottom_raw = [tl, tr], [bl, br_pt]
+                        top_corners = _drop_interior_and_symmetric_opposite(top_raw)
+                        bottom_corners = _drop_interior_and_symmetric_opposite(bottom_raw)
+                        if not _already_drawn_from(float(top_end[0]), float(top_end[1])) and top_corners and bottom_corners:
+                            for c in top_corners:
+                                sx, sy = _snap_to_boundary(float(c[0]), float(c[1]))
+                                lx, ly, lz = _segment_to_plotly_line(top_end, [sx, sy, z1])
+                                lx_aframe.extend(lx)
+                                ly_aframe.extend(ly)
+                                lz_aframe.extend(lz)
+                            _mark_drawn(float(top_end[0]), float(top_end[1]))
+                        if not _already_drawn_from(float(bottom_end[0]), float(bottom_end[1])) and top_corners and bottom_corners:
+                            for c in bottom_corners:
+                                sx, sy = _snap_to_boundary(float(c[0]), float(c[1]))
+                                lx, ly, lz = _segment_to_plotly_line(bottom_end, [sx, sy, z1])
+                                lx_aframe.extend(lx)
+                                ly_aframe.extend(ly)
+                                lz_aframe.extend(lz)
+                            _mark_drawn(float(bottom_end[0]), float(bottom_end[1]))
+                for sec in kept_extended:
+                    ridge = sec.get("ridge_line", [])
+                    if len(ridge) >= 2:
+                        r0, r1 = ridge[0], ridge[1]
+                        lx, ly, lz = _segment_to_plotly_line(
+                            [float(r0[0]), float(r0[1]), z_ridge_common],
+                            [float(r1[0]), float(r1[1]), z_ridge_common],
+                        )
+                        lx_ridge.extend(lx)
+                        ly_ridge.extend(ly)
+                        lz_ridge.extend(lz)
+                coords_ex = list(floor_poly.exterior.coords) if hasattr(floor_poly, "exterior") else []
+                for i in range(len(coords_ex) - 1):
+                    p1, p2 = coords_ex[i], coords_ex[i + 1]
+                    x1, y1 = float(p1[0]), float(p1[1])
+                    x2, y2 = float(p2[0]), float(p2[1])
+                    lx, ly, lz = _segment_to_plotly_line([x1, y1, z1], [x2, y2, z1])
+                    lx_green.extend(lx)
+                    ly_green.extend(ly)
+                    lz_green.extend(lz)
+
+            # extend_segments_mode: prelungiri la capete în direcția segmentului (altă culoare)
+            if extend_segments_mode and overhang_px > 0:
+                segs = get_roof_segments_3d(
+                    kept_extended, floor_poly, wall_height=float(z1), roof_angle_deg=roof_angle_deg,
+                )
+                floor_geom = floor_poly if (floor_poly is not None and not getattr(floor_poly, "is_empty", True)) else None
+                for _p1, _p2 in segs:
+                    px1, py1, pz1 = float(_p1[0]), float(_p1[1]), float(_p1[2])
+                    px2, py2, pz2 = float(_p2[0]), float(_p2[1]), float(_p2[2])
+                    dx, dy, dz = px2 - px1, py2 - py1, pz2 - pz1
+                    L = math.sqrt(dx * dx + dy * dy + dz * dz)
+                    if L < 1e-9:
+                        continue
+                    dx, dy, dz = dx / L, dy / L, dz / L
+                    ext = float(overhang_px)
+                    ext_p1 = [px1 - dx * ext, py1 - dy * ext, pz1 - dz * ext]
+                    ext_p2 = [px2 + dx * ext, py2 + dy * ext, pz2 + dz * ext]
+
+                    def _keep_ext(a: List[float]) -> bool:
+                        ax, ay, az = float(a[0]), float(a[1]), float(a[2])
+                        if az > z_ridge_common + 1e-6:
+                            return False
+                        if floor_geom is not None:
+                            try:
+                                pt = ShapelyPoint(ax, ay)
+                                if floor_geom.contains(pt):
+                                    return False
+                            except Exception:
+                                pass
+                        return True
+
+                    for a1, a2, outer in [
+                        ([ext_p1[0], ext_p1[1], ext_p1[2]], [px1, py1, pz1], ext_p1),
+                        ([px2, py2, pz2], [ext_p2[0], ext_p2[1], ext_p2[2]], ext_p2),
+                    ]:
+                        if not _keep_ext(outer):
+                            continue
+                        lx0, ly0, lz0 = _segment_to_plotly_line(
+                            [float(a1[0]), float(a1[1]), float(a1[2])],
+                            [float(a2[0]), float(a2[1]), float(a2[2])],
+                        )
+                        lx_ext.extend(lx0)
+                        ly_ext.extend(ly0)
+                        lz_ext.extend(lz0)
+                        ext_outer_points.append([float(outer[0]), float(outer[1]), float(outer[2])])
+
+            # Fețe strict din a_faces.png (a_faces_faces.json) – niciodată fallback
+            raw_faces: List[List[List[float]]] = []
+            if draw_roof:
+                raw_faces_from_etaj = a_faces_by_etaj.get(_orig_idx) if _orig_idx is not None else None
+                if raw_faces_from_etaj:
+                    for f in raw_faces_from_etaj:
+                        vs = f.get("vertices_3d") or []
+                        if len(vs) >= 3:
+                            raw_faces.append([[float(v[0]) + ox, float(v[1]) + oy, float(v[2]) + z0] for v in vs])
+            if raw_faces:
+                if final_mode and draw_roof and overhang_px > 0 and kept_extended:
+                    free = (
+                        compute_overhang_sides_from_footprint(kept_extended, floor_poly)
+                        if floor_poly is not None and not getattr(floor_poly, "is_empty", True)
+                        else compute_overhang_sides_from_union_boundary(kept_extended)
+                    )
+                    kept_oh = apply_overhang_to_sections(kept_extended, overhang_px=overhang_px, free_sides=free)
+                    corner_lines_oh = ridge_intersection_corner_lines(kept_oh, floor_polygon=floor_poly)
+                    roof_faces_oh = get_faces_3d_aframe_with_magenta(
+                        kept_oh, conns_kept, roof_angle_deg=roof_angle_deg, wall_height=float(z1),
+                        corner_lines=corner_lines_oh, floor_polygon=floor_poly,
+                    )
+                    roof_faces_oh_dicts = [{"vertices_3d": f.get("vertices_3d", [])} for f in roof_faces_oh if f.get("vertices_3d")]
+                    top_floor_for_final = (
+                        kept_oh, float(z1), overhang_px, roof_angle_deg,
+                        roof_faces_oh_dicts, free,
+                    )
+                display_faces = raw_faces
+                rng = random.Random(42)
+                faces_sorted = sorted(
+                    [(sum(float(v[1]) for v in vs) / len(vs), vs) for vs in display_faces if len(vs) >= 3],
+                    key=lambda t: t[0], reverse=True,
+                )
+                brick_rgba = "rgba(181,82,51,0.75)" if final_mode else None
+                for _cy, vs in faces_sorted:
+                    if final_mode:
+                        rgba = brick_rgba
+                    else:
+                        r, g, b = rng.random(), rng.random(), rng.random()
+                        rgba = f"rgba({int(r*255)},{int(g*255)},{int(b*255)},0.75)"
+                    roof_faces_with_colors.append((vs, rgba))
+
+    # extend_segments_mode: contur care înconjoară capetele segmentelor albastre
+    lx_contour, ly_contour, lz_contour = [], [], []
+    if extend_segments_mode and len(ext_outer_points) >= 3:
+        seen: Set[Tuple[float, float, float]] = set()
+        unique: List[List[float]] = []
+        for p in ext_outer_points:
+            k = (round(p[0], 2), round(p[1], 2), round(p[2], 2))
+            if k not in seen:
+                seen.add(k)
+                unique.append(p)
+        if len(unique) >= 3:
+            cx = sum(q[0] for q in unique) / len(unique)
+            cy = sum(q[1] for q in unique) / len(unique)
+            ordered = sorted(unique, key=lambda q: math.atan2(float(q[1]) - cy, float(q[0]) - cx))
+            ordered.append(ordered[0])
+            for i in range(len(ordered) - 1):
+                a, b = ordered[i], ordered[i + 1]
+                lx0, ly0, lz0 = _segment_to_plotly_line(
+                    [float(a[0]), float(a[1]), float(a[2])],
+                    [float(b[0]), float(b[1]), float(b[2])],
+                )
+                lx_contour.extend(lx0)
+                ly_contour.extend(ly0)
+                lz_contour.extend(lz0)
+
+    if not xs_all and not ys_all:
+        xs_all = [0.0]
+        ys_all = [0.0]
+    minx_b = float(min(xs_all))
+    maxx_b = float(max(xs_all))
+    miny_b = float(min(ys_all))
+    maxy_b = float(max(ys_all))
+    pad = max(60.0, 0.08 * max(maxx_b - minx_b, maxy_b - miny_b, 1.0))
+    minx_b, maxx_b = minx_b - pad, maxx_b + pad
+    miny_b, maxy_b = miny_b - pad, maxy_b + pad
+
+    n = max(1, len(views))
+    fig = make_subplots(
+        rows=1, cols=n,
+        specs=[[{"type": "scene"} for _ in range(n)]],
+        subplot_titles=[v.get("title", f"View {i+1}") for i, v in enumerate(views[:n])],
+    )
+
+    def add_line_trace(lx: List[float], ly: List[float], lz: List[float], color: str, name: str) -> None:
+        if len(lx) == 0:
+            return
+        for col_idx in range(n):
+            fig.add_trace(
+                go.Scatter3d(
+                    x=lx, y=ly, z=lz,
+                    mode="lines",
+                    line=dict(color=color, width=3),
+                    name=name,
+                    legendgroup=name,
+                ),
+                row=1, col=col_idx + 1,
+            )
+
+    # Fețe transparente din a_faces (desenate în spatele liniilor)
+    def _face_to_mesh_triangles(vs: List[List[float]]) -> Tuple[List[float], List[float], List[float], List[int], List[int], List[int]]:
+        """Triangulare fan: (0,1,2), (0,2,3), ..."""
+        xs = [float(v[0]) for v in vs]
+        ys = [float(v[1]) for v in vs]
+        zs = [float(v[2]) for v in vs]
+        ni = len(vs)
+        ii, jj, kk = [], [], []
+        for i in range(1, ni - 1):
+            ii.append(0)
+            jj.append(i)
+            kk.append(i + 1)
+        return xs, ys, zs, ii, jj, kk
+
+    if roof_faces_with_colors:
+        first_face_name = "Fețe acoperiș (caramiză)" if final_mode else "Fețe acoperiș (a_faces)"
+        for idx, (vs, rgba) in enumerate(roof_faces_with_colors):
+            xs, ys, zs, ii, jj, kk = _face_to_mesh_triangles(vs)
+            if not ii:
+                continue
+            for col_idx in range(n):
+                fig.add_trace(
+                    go.Mesh3d(
+                        x=xs, y=ys, z=zs,
+                        i=ii, j=jj, k=kk,
+                        color=rgba,
+                        opacity=0.75,
+                        flatshading=True,
+                        name=first_face_name if idx == 0 else None,
+                        showlegend=(idx == 0),
+                        legendgroup=first_face_name,
+                    ),
+                    row=1, col=col_idx + 1,
+                )
+
+    # final_mode: drip edge, burlane (jgheaburi), streșini 3D – același pipeline ca visualize_3d_standard_plotly
+    if final_mode and overhang_px > 0 and top_floor_for_final:
+        try:
+            kept_oh, z1_f, oh_px, r_angle, roof_faces_list, free_drip = top_floor_for_final
+            _kw = {"roof_faces": roof_faces_list, "include_eaves_only": True, "eaves_z_lift": oh_px * 0.60}
+            drip_faces = get_drip_edge_faces_3d(
+                kept_oh, z1_f, oh_px, r_angle, roof_faces=roof_faces_list, free_sides=free_drip,
+            )
+            for idx_df, df in enumerate(drip_faces):
+                v = df.get("vertices_3d")
+                if v and len(v) >= 3:
+                    xs, ys, zs, ii, jj, kk = _face_to_mesh_triangles(v)
+                    if ii:
+                        for col_idx in range(n):
+                            fig.add_trace(
+                                go.Mesh3d(
+                                    x=xs, y=ys, z=zs, i=ii, j=jj, k=kk,
+                                    color="rgba(139,69,19,0.9)", opacity=0.9,
+                                    flatshading=True, name="Drip" if idx_df == 0 else None,
+                                    showlegend=(idx_df == 0), legendgroup="Drip",
+                                ),
+                                row=1, col=col_idx + 1,
+                            )
+            gutter_faces_list = get_gutter_faces_3d(kept_oh, z1_f, oh_px, r_angle, **_kw)
+            for idx_gf, gf in enumerate(gutter_faces_list):
+                v = gf.get("vertices_3d")
+                if v and len(v) >= 3:
+                    xs, ys, zs, ii, jj, kk = _face_to_mesh_triangles(v)
+                    if ii:
+                        for col_idx in range(n):
+                            fig.add_trace(
+                                go.Mesh3d(
+                                    x=xs, y=ys, z=zs, i=ii, j=jj, k=kk,
+                                    color="rgba(107,114,128,0.95)", opacity=0.95,
+                                    flatshading=True, name="Burlane" if idx_gf == 0 else None,
+                                    showlegend=(idx_gf == 0), legendgroup="Burlane",
+                                ),
+                                row=1, col=col_idx + 1,
+                            )
+            ep = list(get_gutter_endpoints_3d(kept_oh, z1_f, oh_px, r_angle, **_kw))
+            gutter_radius = max(2.0, oh_px * 0.24) * 0.70 if oh_px > 0 else 2.0
+            seg_sections = [kept_oh] * max(1, len(ep) // 2) if ep else []
+            downspout_result = get_downspout_faces_for_floors(
+                [(fp[0], fp[1], fp[2], fp[3]) for fp in floors_payload], wall_height,
+                cylinder_radius=gutter_radius, gutter_endpoints=ep,
+                gutter_segment_sections=seg_sections if seg_sections else None,
+                return_used_endpoints=True,
+            )
+            used_ep = downspout_result[1] if isinstance(downspout_result, tuple) and len(downspout_result) > 1 else []
+            ds_faces = downspout_result[0] if isinstance(downspout_result, tuple) else downspout_result
+            for df in (ds_faces if isinstance(ds_faces, list) else [ds_faces]):
+                v = (df.get("vertices_3d") if isinstance(df, dict) else []) or []
+                if v and len(v) >= 3:
+                    xs, ys, zs, ii, jj, kk = _face_to_mesh_triangles(v)
+                    if ii:
+                        for col_idx in range(n):
+                            fig.add_trace(
+                                go.Mesh3d(x=xs, y=ys, z=zs, i=ii, j=jj, k=kk,
+                                    color="rgba(107,114,128,0.95)", opacity=0.95, flatshading=True, showlegend=False),
+                                row=1, col=col_idx + 1,
+                            )
+            closure_kw = dict(_kw, downspout_endpoints=used_ep)
+            for gf in get_gutter_end_closures_3d(kept_oh, z1_f, oh_px, r_angle, **closure_kw):
+                v = gf.get("vertices_3d")
+                if v and len(v) >= 3:
+                    xs, ys, zs, ii, jj, kk = _face_to_mesh_triangles(v)
+                    if ii:
+                        for col_idx in range(n):
+                            fig.add_trace(
+                                go.Mesh3d(x=xs, y=ys, z=zs, i=ii, j=jj, k=kk,
+                                    color="rgba(107,114,128,0.95)", opacity=0.95, flatshading=True, showlegend=False),
+                                row=1, col=col_idx + 1,
+                            )
+        except Exception:
+            pass
+
+    lx_wall, ly_wall, lz_wall = [], [], []
+    for floor_idx, item in enumerate(floors_payload):
+        _path, floor_poly, _rr, _offset = item[0], item[1], item[2], item[3]
+        z0 = floor_idx * wall_height
+        z1 = (floor_idx + 1) * wall_height
+        coords = list(floor_poly.exterior.coords) if hasattr(floor_poly, "exterior") else []
+        for i in range(len(coords) - 1):
+            p1, p2 = coords[i], coords[i + 1]
+            x1, y1 = float(p1[0]), float(p1[1])
+            x2, y2 = float(p2[0]), float(p2[1])
+            for (a1, b1, za), (a2, b2, zb) in [
+                ((x1, y1, z0), (x2, y2, z0)),
+                ((x1, y1, z1), (x2, y2, z1)),
+                ((x1, y1, z0), (x1, y1, z1)),
+                ((x2, y2, z0), (x2, y2, z1)),
+            ]:
+                lx, ly, lz = _segment_to_plotly_line([a1, b1, za], [a2, b2, zb])
+                lx_wall.extend(lx)
+                ly_wall.extend(ly)
+                lz_wall.extend(lz)
+    add_line_trace(lx_wall, ly_wall, lz_wall, "#95A5A6", "Pereți")
+    add_line_trace(lx_ext, ly_ext, lz_ext, "#00BFFF", "Prelungiri segmente acoperiș")
+    add_line_trace(lx_contour, ly_contour, lz_contour, "#0066CC", "Contur prelungiri")
+    add_line_trace(lx_aframe, ly_aframe, lz_aframe, "#FF8C00", "Deschideri A-frame (ridge→streașină)")
+    add_line_trace(lx_magenta, ly_magenta, lz_magenta, "#CC00FF", "Linii intersecție → colțuri")
+    add_line_trace(lx_ridge, ly_ridge, lz_ridge, "#8B0000", "Ridge")
+    add_line_trace(lx_green, ly_green, lz_green, "#2ECC71", "Contur casă (streașină)")
+
+    for col_idx in range(n):
+        v = views[col_idx] if col_idx < len(views) else {"elev": 30, "azim": 45}
+        eye = _camera_eye_from_elev_azim(float(v.get("elev", 30)), float(v.get("azim", 45)), scale=1.8)
+        scene_name = "scene" if col_idx == 0 else f"scene{col_idx+1}"
+        fig.update_layout(**{
+            scene_name: dict(
+                xaxis=dict(range=[minx_b, maxx_b], backgroundcolor="white", gridcolor="lightgrey"),
+                yaxis=dict(range=[miny_b, maxy_b], backgroundcolor="white", gridcolor="lightgrey"),
+                zaxis=dict(range=[0, z_max], backgroundcolor="white", gridcolor="lightgrey"),
+                aspectmode="data",
+                camera=dict(eye=eye, up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=0), projection=dict(type="perspective")),
+            )
+        })
+
+    fig.update_layout(showlegend=True, legend=dict(orientation="h", yanchor="top", y=1.02), margin=dict(l=10, r=10, t=60, b=10))
+
+    ok_png = False
+    ok_html = False
+    if html_output_path:
+        try:
+            Path(html_output_path).parent.mkdir(parents=True, exist_ok=True)
+            fig.write_html(html_output_path, include_plotlyjs="cdn", full_html=True)
+            ok_html = True
+        except Exception:
+            pass
+    if output_path:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fig.write_image(output_path, width=1200 * n, height=900, scale=2)
+            ok_png = True
+        except Exception:
+            pass
+    return ok_png if output_path else ok_html
+
+
+def visualize_3d_a_frame_plotly(
+    output_path: str,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+    all_floor_paths: Optional[List[str]] = None,
+    floor_roof_results: Optional[List[Dict[str, Any]]] = None,
+    html_output_path: Optional[str] = None,
+    roof_levels: Optional[List[Tuple[float, Dict[str, Any], float, float, int]]] = None,
+    use_a_lines_structure: bool = True,
+) -> bool:
+    """
+    Randare 3D A-frame: pereți + segmente din get_roof_segments_3d (identice cu house_render).
+    Salvează house_a_frame.png și house_a_frame.html.
+    """
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except Exception:
+        return False
+
+    import cv2
+    from shapely.geometry import Polygon as ShapelyPolygon
+    from shapely.ops import unary_union
+    from shapely import affinity as shapely_affinity
+
+    from roof_calc.flood_fill import flood_fill_interior, get_house_shape_mask
+    from roof_calc.geometry import extract_polygon
+    from roof_calc.overhang import (
+        extend_sections_to_connect,
+        extend_secondary_sections_to_main_ridge,
+        ridge_intersection_corner_lines,
+    )
+    from roof_calc.roof_segments_3d import get_faces_3d_from_segments
+
+    if not all_floor_paths or not floor_roof_results or len(all_floor_paths) != len(floor_roof_results):
+        return False
+
+    def _polygon_from_path(path: str) -> Optional[Any]:
+        im = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if im is None:
+            return None
+        filled0 = flood_fill_interior(im)
+        house0 = get_house_shape_mask(filled0)
+        poly0 = extract_polygon(house0)
+        if poly0 is None or poly0.is_empty:
+            return None
+        return poly0
+
+    def _compute_offsets(paths: List[str], results: List[Dict[str, Any]]) -> Dict[str, Tuple[int, int]]:
+        polys = [_polygon_from_path(p) for p in paths]
+        best_idx = 0
+        best_area = -1.0
+        for i, poly in enumerate(polys):
+            if poly is not None and not getattr(poly, "is_empty", True):
+                a = float(getattr(poly, "area", 0) or 0)
+                if a > best_area:
+                    best_area = a
+                    best_idx = i
+        ref_poly = polys[best_idx] if best_idx < len(polys) else None
+        cx_ref = float(ref_poly.centroid.x) if ref_poly and not getattr(ref_poly, "is_empty", True) else 0.0
+        cy_ref = float(ref_poly.centroid.y) if ref_poly and not getattr(ref_poly, "is_empty", True) else 0.0
+        out: Dict[str, Tuple[int, int]] = {}
+        for p, poly in zip(paths, polys):
+            if poly is None or getattr(poly, "is_empty", True):
+                out[p] = (int(round(-cx_ref)), int(round(-cy_ref)))
+            else:
+                c = poly.centroid
+                out[p] = (int(round(cx_ref - c.x)), int(round(cy_ref - c.y)))
+        return out
+
+    def _translate_sections(secs: List[Dict[str, Any]], dx: float, dy: float) -> List[Dict[str, Any]]:
+        out = []
+        for sec in secs:
+            rect = sec.get("bounding_rect", [])
+            ridge = sec.get("ridge_line", [])
+            out.append({
+                **sec,
+                "bounding_rect": [(float(p[0]) + dx, float(p[1]) + dy) for p in rect] if rect else [],
+                "ridge_line": [(float(p[0]) + dx, float(p[1]) + dy) for p in ridge] if ridge and len(ridge) >= 2 else [],
+            })
+        return out
+
+    def _filter_connections_by_sections(conns: List[Dict[str, Any]], keep_ids: set[int]) -> List[Dict[str, Any]]:
+        out = []
+        for c in conns or []:
+            ids = c.get("section_ids") or c.get("section_id") or []
+            try:
+                lst = ids if isinstance(ids, (list, tuple)) else [ids]
+                if all(int(x) in keep_ids for x in lst):
+                    out.append(c)
+            except Exception:
+                pass
+        return out
+
+    def _covered_by_upper(sec_poly: Any, union_above: Any, area_thresh: float = 500.0) -> bool:
+        if union_above is None or getattr(union_above, "is_empty", True):
+            return False
+        try:
+            rem = sec_poly.difference(union_above)
+            return float(getattr(rem, "area", 0.0) or 0.0) < area_thresh
+        except Exception:
+            return False
+
+    config = config or {}
+    roof_angle_deg = float(config.get("roof_angle", 30.0))
+    wall_height = float(config.get("wall_height", 300.0))
+    views = config.get("views", [{"elev": 30, "azim": 45, "title": "Sud-Est"}, {"elev": 20, "azim": 225, "title": "Nord-Vest"}])
+
+    # Încarcă fețe din a_faces – strict ce e în a_faces.png
+    a_faces_by_etaj = {}
+    try:
+        import json
+        out_dir = Path(output_path).parent
+        for etaj_dir in sorted(out_dir.glob("etaj_*")):
+            if not etaj_dir.is_dir():
+                continue
+            try:
+                etaj_idx = int(etaj_dir.name.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+            faces_path = etaj_dir / "a_faces_faces.json"
+            if not faces_path.exists():
+                continue
+            data = json.loads(faces_path.read_text(encoding="utf-8"))
+            faces = data.get("faces", [])
+            if faces:
+                a_faces_by_etaj[etaj_idx] = faces
+    except Exception:
+        pass
+
+    # Pereții din imaginile pereților – acoperișurile se pun corect peste ei
+    offsets = _compute_offsets(all_floor_paths, floor_roof_results)
+    floors_payload = []
+    for idx, (p, rr) in enumerate(zip(all_floor_paths, floor_roof_results)):
+        poly0 = _polygon_from_path(p)
+        if poly0 is None:
+            continue
+        ox, oy = offsets.get(p, (0, 0))
+        poly_t = shapely_affinity.translate(poly0, xoff=ox, yoff=oy)
+        floors_payload.append((p, poly_t, rr, (ox, oy), idx))
+    if not floors_payload:
+        return False
+    floors_payload.sort(key=lambda t: (-(float(getattr(t[1], "area", 0.0) or 0.0)), t[4]))
+    num_floors = len(floors_payload)
+    z_max = num_floors * wall_height + 500
+
+    tri_by_color: Dict[str, List[List[List[float]]]] = {}
+    RED = "#FF0000"
+    GRAY = "#95A5A6"
+    roof_face_edges: List[Tuple[List[float], List[float]]] = []
+
+    def add_face(face: List[List[float]], color_hex: str) -> None:
+        tris = _triangulate_face(face)
+        if not tris:
+            tris = _triangulate_fan(face)
+        for tri in tris:
+            tri_by_color.setdefault(color_hex, []).append(tri)
+
+    xs_all: List[float] = []
+    ys_all: List[float] = []
+
+    for floor_idx, payload_item in enumerate(floors_payload):
+        _p, floor_poly, rr, (ox, oy) = payload_item[0], payload_item[1], payload_item[2], payload_item[3]
+        _orig_idx = payload_item[4] if len(payload_item) > 4 else floor_idx
+        z0 = floor_idx * wall_height
+        z1 = (floor_idx + 1) * wall_height
+        coords = list(floor_poly.exterior.coords) if hasattr(floor_poly, "exterior") else []
+        for c in coords:
+            xs_all.append(float(c[0]))
+            ys_all.append(float(c[1]))
+
+        for i in range(len(coords) - 1):
+            x1, y1 = float(coords[i][0]), float(coords[i][1])
+            x2, y2 = float(coords[i + 1][0]), float(coords[i + 1][1])
+            add_face([[x1, y1, z0], [x2, y2, z0], [x2, y2, z1], [x1, y1, z1]], GRAY)
+
+        draw_roof = True
+        union_above = None
+        if floor_idx + 1 < len(floors_payload):
+            union_above = unary_union([fp[1] for fp in floors_payload[floor_idx + 1:]])
+        secs = rr.get("sections") or []
+        conns = rr.get("connections") or []
+        kept: List[Dict[str, Any]] = []
+        keep_ids: set[int] = set()
+        for sec in secs:
+            br = sec.get("bounding_rect", [])
+            if len(br) < 3:
+                continue
+            sp = ShapelyPolygon(br)
+            sp = shapely_affinity.translate(sp, xoff=ox, yoff=oy)
+            if _covered_by_upper(sp, union_above, area_thresh=500.0):
+                continue
+            sec_t = _translate_sections([sec], float(ox), float(oy))[0]
+            kept.append(sec_t)
+            try:
+                keep_ids.add(int(sec_t.get("section_id")))
+            except Exception:
+                pass
+        conns_kept = _filter_connections_by_sections(conns, keep_ids)
+        kept_extended = extend_sections_to_connect(kept, conns_kept) if (draw_roof and kept and conns_kept) else kept
+        if draw_roof and kept_extended:
+            kept_extended = extend_secondary_sections_to_main_ridge(kept_extended)
+
+        if draw_roof and kept_extended:
+            # Fețe strict din a_faces.png – fără fallback
+            roof_faces_data: List[Dict[str, Any]] = []
+            raw_faces_from_etaj = a_faces_by_etaj.get(_orig_idx) if _orig_idx is not None else None
+            if raw_faces_from_etaj:
+                for f in raw_faces_from_etaj:
+                    vs = f.get("vertices_3d") or []
+                    if vs:
+                        roof_faces_data.append({
+                            "vertices_3d": [[float(v[0]) + ox, float(v[1]) + oy, float(v[2]) + z0] for v in vs],
+                        })
+            if roof_faces_data:
+                seen_edge: set = set()
+                tol = 1e-4
+
+                def _edge_key(a: List[float], b: List[float]) -> tuple:
+                    ka = (round(a[0] / tol) * tol, round(a[1] / tol) * tol, round(a[2] / tol) * tol)
+                    kb = (round(b[0] / tol) * tol, round(b[1] / tol) * tol, round(b[2] / tol) * tol)
+                    return (ka, kb) if ka <= kb else (kb, ka)
+
+                for f in roof_faces_data:
+                    vs = f.get("vertices_3d") or []
+                    if vs:
+                        add_face(vs, RED)
+                        for i in range(len(vs)):
+                            p1, p2 = list(vs[i]), list(vs[(i + 1) % len(vs)])
+                            key = _edge_key(p1, p2)
+                            if key not in seen_edge:
+                                seen_edge.add(key)
+                                roof_face_edges.append((p1, p2))
+
+    if not xs_all and not ys_all:
+        xs_all = [0.0]
+        ys_all = [0.0]
+    minx_b = float(min(xs_all))
+    maxx_b = float(max(xs_all))
+    miny_b = float(min(ys_all))
+    maxy_b = float(max(ys_all))
+    pad = max(60.0, 0.08 * max(maxx_b - minx_b, maxy_b - miny_b, 1.0))
+    minx_b, maxx_b = minx_b - pad, maxx_b + pad
+    miny_b, maxy_b = miny_b - pad, maxy_b + pad
+
+    n = max(1, len(views))
+    fig = make_subplots(
+        rows=1, cols=n,
+        specs=[[{"type": "scene"} for _ in range(n)]],
+        subplot_titles=[v.get("title", f"View {i+1}") for i, v in enumerate(views[:n])],
+    )
+
+    tris_all: List[List[List[float]]] = []
+    for color_hex, tris in tri_by_color.items():
+        tris_all.extend(tris)
+
+    for col_idx in range(n):
+        shadow_tris = [[[vx, vy, 0.0] for vx, vy, vz in tri] for tri in tris_all]
+        if shadow_tris:
+            xs_s, ys_s, zs_s = [], [], []
+            ii_s, jj_s, kk_s = [], [], []
+            for tri in shadow_tris:
+                base = len(xs_s)
+                for vx, vy, vz in tri:
+                    xs_s.append(float(vx))
+                    ys_s.append(float(vy))
+                    zs_s.append(float(vz))
+                ii_s.append(base + 0)
+                jj_s.append(base + 1)
+                kk_s.append(base + 2)
+            fig.add_trace(
+                go.Mesh3d(
+                    x=xs_s, y=ys_s, z=zs_s, i=ii_s, j=jj_s, k=kk_s,
+                    color="rgba(0,0,0,0.25)",
+                    opacity=0.25,
+                    flatshading=True,
+                    name="Umbră",
+                    legendgroup="Umbră",
+                ),
+                row=1, col=col_idx + 1,
+            )
+
+        for color_hex, tris in tri_by_color.items():
+            if not tris:
+                continue
+            xs: List[float] = []
+            ys: List[float] = []
+            zs: List[float] = []
+            ii: List[int] = []
+            jj: List[int] = []
+            kk: List[int] = []
+            for tri in tris:
+                base = len(xs)
+                for vx, vy, vz in tri:
+                    xs.append(float(vx))
+                    ys.append(float(vy))
+                    zs.append(float(vz))
+                ii.append(base + 0)
+                jj.append(base + 1)
+                kk.append(base + 2)
+            r01, g01, b01 = _hex_to_rgb01(color_hex)
+            name = "Acoperiș" if color_hex == RED else "Pereți"
+            fig.add_trace(
+                go.Mesh3d(
+                    x=xs, y=ys, z=zs, i=ii, j=jj, k=kk,
+                    color=f"rgb({int(r01*255)},{int(g01*255)},{int(b01*255)})",
+                    opacity=1.0,
+                    flatshading=True,
+                    name=name,
+                    legendgroup=name,
+                ),
+                row=1, col=col_idx + 1,
+            )
+
+        lx_outline, ly_outline, lz_outline = [], [], []
+        for p1, p2 in roof_face_edges:
+            lx, ly, lz = _segment_to_plotly_line(list(p1), list(p2))
+            lx_outline.extend(lx)
+            ly_outline.extend(ly)
+            lz_outline.extend(lz)
+        for floor_idx, (_path, floor_poly, _rr, _offset) in enumerate(floors_payload):
+            z0 = floor_idx * wall_height
+            z1 = (floor_idx + 1) * wall_height
+            coords = list(floor_poly.exterior.coords) if hasattr(floor_poly, "exterior") else []
+            for i in range(len(coords) - 1):
+                x1, y1 = float(coords[i][0]), float(coords[i][1])
+                x2, y2 = float(coords[i + 1][0]), float(coords[i + 1][1])
+                for (a1, b1, za), (a2, b2, zb) in [
+                    ((x1, y1, z0), (x2, y2, z0)),
+                    ((x1, y1, z1), (x2, y2, z1)),
+                    ((x1, y1, z0), (x1, y1, z1)),
+                    ((x2, y2, z0), (x2, y2, z1)),
+                ]:
+                    lx, ly, lz = _segment_to_plotly_line([a1, b1, za], [a2, b2, zb])
+                    lx_outline.extend(lx)
+                    ly_outline.extend(ly)
+                    lz_outline.extend(lz)
+        if lx_outline:
+            fig.add_trace(
+                go.Scatter3d(
+                    x=lx_outline, y=ly_outline, z=lz_outline,
+                    mode="lines",
+                    line=dict(color="black", width=2),
+                    hoverinfo="skip",
+                    showlegend=False,
+                ),
+                row=1, col=col_idx + 1,
+            )
+
+    for col_idx in range(n):
+        v = views[col_idx] if col_idx < len(views) else {"elev": 30, "azim": 45}
+        eye = _camera_eye_from_elev_azim(float(v.get("elev", 30)), float(v.get("azim", 45)), scale=1.8)
+        scene_name = "scene" if col_idx == 0 else f"scene{col_idx+1}"
+        fig.update_layout(**{
+            scene_name: dict(
+                xaxis=dict(range=[minx_b, maxx_b], backgroundcolor="white", gridcolor="lightgrey"),
+                yaxis=dict(range=[miny_b, maxy_b], backgroundcolor="white", gridcolor="lightgrey"),
+                zaxis=dict(range=[0, z_max], backgroundcolor="white", gridcolor="lightgrey"),
+                aspectmode="data",
+                camera=dict(eye=eye, up=dict(x=0, y=0, z=1), center=dict(x=0, y=0, z=0), projection=dict(type="perspective")),
+            )
+        })
+
+    fig.update_layout(showlegend=True, legend=dict(orientation="h", yanchor="top", y=1.02), margin=dict(l=10, r=10, t=60, b=10))
+
+    ok_png = False
+    ok_html = False
+    if html_output_path:
+        try:
+            Path(html_output_path).parent.mkdir(parents=True, exist_ok=True)
+            fig.write_html(html_output_path, include_plotlyjs="cdn", full_html=True)
+            ok_html = True
+        except Exception:
+            pass
+    if output_path:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fig.write_image(output_path, width=1200 * n, height=900, scale=2)
+            ok_png = True
+        except Exception:
+            pass
     return ok_png if output_path else ok_html
 
