@@ -85,8 +85,10 @@ def _roof_section_faces_shed(
     high_side: str,
 ) -> List[List[List[float]]]:
     """
-    Acoperiș într-o apă (o singură pantă).
+    Acoperiș într-o apă (1_w – o singură pantă).
     high_side: "top" | "bottom" | "left" | "right" - latura unde e creasta (partea mai înaltă).
+    Înălțimea crestei (ridge) este întotdeauna derivată din unghiul pantei: ridge_z = base_z + span * tan(angle).
+    Nu se folosește nicio înălțime prestabilită – doar unghiul din formular (Dachneigung).
     """
     faces: List[List[List[float]]] = []
     bounding_rect = sec.get("bounding_rect", [])
@@ -97,13 +99,14 @@ def _roof_section_faces_shed(
     miny = min(p[1] for p in bounding_rect)
     maxy = max(p[1] for p in bounding_rect)
 
-    # Span = distanța perpendiculară pe latura înaltă până la latura opusă
+    # Span = distanța perpendiculară pe latura înaltă până la latura opusă (de la streașină la creastă)
     if high_side in ("top", "bottom"):
         span = float(maxy - miny)
     else:
         span = float(maxx - minx)
     if span <= 0:
         return faces
+    # Înălțime creastă raportată la unghiul pantei: ridge_z = base_z + span * tan(angle)
     ridge_z = base_z + span * float(np.tan(roof_angle_rad))
 
     # Un singur plan înclinat: 4 colțuri, 2 la ridge_z (latura înaltă), 2 la base_z (latura jos)

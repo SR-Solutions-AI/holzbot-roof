@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import random
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -3197,6 +3198,158 @@ def generate_entire_frame_html(
         pass
 
 
+def _mask_area_and_contour_px(mask: np.ndarray) -> Tuple[float, float]:
+    """Returnează (area_px, contour_px) pentru o mască binară."""
+    if mask is None or mask.size == 0:
+        return 0.0, 0.0
+    area_px = float(np.count_nonzero(mask > 0))
+    contours, _ = cv2.findContours(
+        (mask > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    contour_px = 0.0
+    for c in contours:
+        if len(c) >= 3:
+            contour_px += float(cv2.arcLength(c, closed=True))
+    return area_px, contour_px
+
+
+def _load_meters_per_pixel_per_floor(output_path: Path, num_floors: int) -> Dict[int, float]:
+    """Încearcă să încarce scale_m_per_px per etaj din scale/ (când rulăm din holzbot-engine)."""
+    result: Dict[int, float] = {}
+    try:
+        scale_root = output_path.resolve().parent.parent / "scale"
+        if not scale_root.is_dir():
+            return result
+        scale_files = sorted(scale_root.glob("*/cubicasa_result.json"))
+        if not scale_files:
+            scale_files = sorted(scale_root.glob("*/scale_result.json"))
+        for floor_idx in range(min(num_floors, len(scale_files))):
+            try:
+                data = json.loads(scale_files[floor_idx].read_text(encoding="utf-8"))
+                mpp = (
+                    data.get("measurements", {}).get("metrics", {}).get("scale_m_per_px")
+                    or data.get("meters_per_pixel")
+                    or data.get("scale_m_per_px")
+                )
+                if mpp is not None and float(mpp) > 0:
+                    result[floor_idx] = float(mpp)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return result
+
+
+def populate_mixed_unfold_and_metrics(
+    entire_mixed_dir: Path,
+    roof_types_dir: Path,
+    floor_roof_types: Dict[int, str],
+    output_path: Path,
+) -> None:
+    """
+    Pentru entire/mixed/: creează unfold/ cu toate măștile roof și roof_metrics.json.
+    roof_metrics.json: area/contour în pixeli și m² per față, per etaj, total.
+    """
+    entire_mixed_dir = Path(entire_mixed_dir)
+    roof_types_dir = Path(roof_types_dir)
+    unfold_dir = entire_mixed_dir / "unfold"
+    unfold_dir.mkdir(parents=True, exist_ok=True)
+
+    floor_dirs = sorted(
+        [d for d in roof_types_dir.iterdir() if d.is_dir() and d.name.startswith("floor_")],
+        key=lambda d: int(d.name.split("_")[1]) if len(d.name.split("_")) > 1 and d.name.split("_")[1].isdigit() else 0,
+    )
+
+    faces_metrics: List[Dict[str, Any]] = []
+    floor_totals: Dict[int, Dict[str, Any]] = {}
+    total_area_px = 0.0
+    total_contour_px = 0.0
+
+    mpp_by_floor = _load_meters_per_pixel_per_floor(output_path, len(floor_dirs) + 1)
+
+    for floor_dir in floor_dirs:
+        fidx = int(floor_dir.name.split("_")[1]) if len(floor_dir.name.split("_")) > 1 and floor_dir.name.split("_")[1].isdigit() else 0
+        rt = floor_roof_types.get(fidx, "2_w")
+        unfold_src = floor_dir / rt / "unfold"
+        if not unfold_src.is_dir():
+            continue
+
+        mpp = mpp_by_floor.get(fidx)
+        floor_area_px = 0.0
+        floor_contour_px = 0.0
+        floor_area_m2: Optional[float] = None
+        floor_contour_m: Optional[float] = None
+
+        for png in sorted(unfold_src.glob("*.png")):
+            face_num = png.stem
+            if not face_num.isdigit():
+                continue
+            dst_name = f"floor_{fidx}_{face_num}.png"
+            dst_path = unfold_dir / dst_name
+            try:
+                shutil.copy2(png, dst_path)
+            except Exception:
+                continue
+
+            mask = cv2.imread(str(dst_path), cv2.IMREAD_GRAYSCALE)
+            area_px, contour_px = _mask_area_and_contour_px(mask)
+            floor_area_px += area_px
+            floor_contour_px += contour_px
+            total_area_px += area_px
+            total_contour_px += contour_px
+
+            area_m2: Optional[float] = None
+            contour_m: Optional[float] = None
+            if mpp is not None and mpp > 0:
+                area_m2 = area_px * (mpp ** 2)
+                contour_m = contour_px * mpp
+
+            faces_metrics.append({
+                "floor_idx": fidx,
+                "face_id": int(face_num),
+                "filename": dst_name,
+                "area_px": round(area_px, 2),
+                "area_m2": round(area_m2, 6) if area_m2 is not None else None,
+                "contour_px": round(contour_px, 2),
+                "contour_m": round(contour_m, 4) if contour_m is not None else None,
+            })
+
+        if mpp is not None and mpp > 0:
+            floor_area_m2 = floor_area_px * (mpp ** 2)
+            floor_contour_m = floor_contour_px * mpp
+
+        floor_totals[fidx] = {
+            "area_px": round(floor_area_px, 2),
+            "area_m2": round(floor_area_m2, 6) if floor_area_m2 is not None else None,
+            "contour_px": round(floor_contour_px, 2),
+            "contour_m": round(floor_contour_m, 4) if floor_contour_m is not None else None,
+        }
+
+    total_area_m2: Optional[float] = None
+    total_contour_m: Optional[float] = None
+    if mpp_by_floor:
+        avg_mpp = sum(mpp_by_floor.values()) / len(mpp_by_floor)
+        if avg_mpp > 0:
+            total_area_m2 = total_area_px * (avg_mpp ** 2)
+            total_contour_m = total_contour_px * avg_mpp
+
+    metrics = {
+        "faces": faces_metrics,
+        "by_floor": floor_totals,
+        "total": {
+            "area_px": round(total_area_px, 2),
+            "area_m2": round(total_area_m2, 6) if total_area_m2 is not None else None,
+            "contour_px": round(total_contour_px, 2),
+            "contour_m": round(total_contour_m, 4) if total_contour_m is not None else None,
+        },
+        "meters_per_pixel_by_floor": {str(k): v for k, v in mpp_by_floor.items()} if mpp_by_floor else None,
+    }
+    (entire_mixed_dir / "roof_metrics.json").write_text(
+        json.dumps(metrics, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 def generate_roof_type_outputs(
     wall_mask_path: str,
     roof_result: Dict[str, Any],
@@ -3438,6 +3591,7 @@ def generate_roof_type_outputs(
                 "faces": [{"vertices_3d": f.get("vertices_3d", [])} for f in faces_data],
                 "polygons_2d": polygons_2d_serial,
                 "wall_height": wall_height,
+                "roof_angle_deg": roof_angle_deg,
                 "has_upper_floor": bool(upper_floor_sections),
                 "segments": {
                     "ridge": [_seg_to_xy(seg) for seg in seg_ridge if len(seg) >= 2],

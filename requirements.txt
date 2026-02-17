@@ -1,11 +1,18 @@
-# holzbot-roof
+# holzbot-roof – toate dependențele directe
+# Instalare: pip install -r requirements.txt
+# (În producție folosești același venv ca holzbot-engine.)
+
+# Imagine și geometrie
 opencv-python>=4.8.0
 numpy>=1.24.0
+Pillow>=10.0.0
 shapely>=2.0.0
 scipy>=1.11.0
-Pillow>=10.0.0
+
+# Vizualizare 2D
 matplotlib>=3.7.0
-pyvista>=0.43.0
+
+# Vizualizare 3D (plotly pentru HTML/PNG, pyvista pentru fețe 3D)
 plotly>=5.18.0
 kaleido>=0.2.0
-
+pyvista>=0.43.0

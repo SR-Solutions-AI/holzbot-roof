@@ -74,12 +74,14 @@ def get_roof_segments_3d(
     tan_angle = math.tan(math.radians(roof_angle_deg))
 
     def _ridge_z(sec: Dict[str, Any]) -> float:
+        """Z al crestei: derivat din roof_angle_deg (panta din formular). Pentru 1_w (shed) ridge e la centru, span = jumătate din latură."""
         br = sec.get("bounding_rect", [])
         if len(br) < 3:
             return z1
         xs = [float(p[0]) for p in br]
         ys = [float(p[1]) for p in br]
         orient = str(sec.get("ridge_orientation", "horizontal"))
+        # Pentru shed (1_w): ridge la centru → span = jumătate; ridge_z = z1 + span*tan(angle)
         span = (max(ys) - min(ys)) / 2.0 if orient == "horizontal" else (max(xs) - min(xs)) / 2.0
         return z1 + span * tan_angle
 

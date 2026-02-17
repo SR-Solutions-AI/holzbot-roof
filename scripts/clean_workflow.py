@@ -26,6 +26,7 @@ from roof_calc.roof_types_workflow import (
     remove_overlapping_rectangles,
     generate_roof_type_outputs,
     generate_entire_frame_html,
+    populate_mixed_unfold_and_metrics,
 )
 
 import cv2
@@ -144,6 +145,16 @@ def run_clean_workflow(wall_mask_path: str, output_dir: str = "output") -> None:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    # Încarcă unghiuri per etaj din floor_roof_angles.json (extrase de Gemini din side_view)
+    floor_roof_angles: dict = {}
+    fra_path = output_path / "floor_roof_angles.json"
+    if fra_path.exists():
+        try:
+            data = json.loads(fra_path.read_text(encoding="utf-8"))
+            floor_roof_angles = {int(k): float(v) for k, v in (data or {}).items()}
+        except Exception:
+            pass
+
     input_path = Path(wall_mask_path)
     all_floor_paths: List[str] = []
 
@@ -159,10 +170,22 @@ def run_clean_workflow(wall_mask_path: str, output_dir: str = "output") -> None:
             return
         all_floor_paths = [wall_mask_path]
 
-    floor_roof_results: List[dict] = []
-    for fp in all_floor_paths:
+    # Încarcă unghiuri per etaj din floor_roof_angles.json (din Gemini/side_view)
+    floor_roof_angles: dict[int, float] = {}
+    fra_path = output_path / "floor_roof_angles.json"
+    if fra_path.exists():
         try:
-            res = calculate_roof_from_walls(fp, roof_angle=30, overhang_px=2.0)
+            fra_data = json.loads(fra_path.read_text(encoding="utf-8"))
+            floor_roof_angles = {int(k): float(v) for k, v in (fra_data or {}).items()}
+        except Exception:
+            pass
+    default_angle = 30.0
+
+    floor_roof_results: List[dict] = []
+    for i, fp in enumerate(all_floor_paths):
+        angle = floor_roof_angles.get(i, default_angle)
+        try:
+            res = calculate_roof_from_walls(fp, roof_angle=angle, overhang_px=2.0)
             floor_roof_results.append(res)
         except Exception as e:
             print(f"⚠ {Path(fp).name}: {e}")
@@ -171,9 +194,10 @@ def run_clean_workflow(wall_mask_path: str, output_dir: str = "output") -> None:
 
     if len(floor_roof_results) != len(all_floor_paths):
         floor_roof_results = []
-        for fp in all_floor_paths:
+        for i, fp in enumerate(all_floor_paths):
+            angle = floor_roof_angles.get(i, default_angle)
             try:
-                floor_roof_results.append(calculate_roof_from_walls(fp, roof_angle=30, overhang_px=2.0))
+                floor_roof_results.append(calculate_roof_from_walls(fp, roof_angle=angle, overhang_px=2.0))
             except Exception:
                 floor_roof_results.append({"sections": []})
 
@@ -275,13 +299,14 @@ def run_clean_workflow(wall_mask_path: str, output_dir: str = "output") -> None:
 
         roof_floor_dir = roof_types_dir / f"floor_{floor_idx}"
         roof_floor_dir.mkdir(parents=True, exist_ok=True)
+        roof_angle_floor = floor_roof_angles.get(floor_idx, default_angle)
         try:
             generate_roof_type_outputs(
                 floor_path,
                 filtered_result,
                 remaining,
                 roof_floor_dir,
-                roof_angle_deg=30.0,
+                roof_angle_deg=roof_angle_floor,
                 wall_height=300.0,
                 upper_floor_sections=upper_sections if upper_sections else None,
             )
@@ -318,6 +343,15 @@ def run_clean_workflow(wall_mask_path: str, output_dir: str = "output") -> None:
                 floor_roof_types=floor_roof_types,
             )
             print(f"   ✓ entire/mixed/frame.html, filled.html (tipuri per etaj)")
+            mixed_dir = output_path / "entire" / "mixed"
+            if mixed_dir.exists():
+                try:
+                    populate_mixed_unfold_and_metrics(
+                        mixed_dir, roof_types_dir, floor_roof_types, output_path
+                    )
+                    print(f"   ✓ entire/mixed/unfold/ + roof_metrics.json")
+                except Exception as e:
+                    print(f"   ⚠ entire/mixed/unfold+metrics: {e}")
         except Exception as e:
             print(f"   ⚠ entire/mixed/: {e}")
 

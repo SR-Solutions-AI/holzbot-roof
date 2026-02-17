@@ -168,6 +168,12 @@ def _face_centroid(verts: List[List[float]]) -> Tuple[float, float, float]:
     return (cx, cy, cz)
 
 
+# Arie minimă pentru masca unfold (px²) – filtrăm măștile degenerate (linie subțire, colț etc.)
+_MIN_UNFOLD_AREA_PX = 1000
+# Raport minim lățime/înălțime – excludem forme aproape 1D (linie)
+_MIN_UNFOLD_ASPECT = 0.02
+
+
 def generate_unfold_masks_for_roof_types(
     faces_data: List[Dict[str, Any]],
     plan_h: int,
@@ -179,6 +185,7 @@ def generate_unfold_masks_for_roof_types(
     Fiecare PNG are dimensiunea planului (plan_h x plan_w), fundal negru, mască albă.
     Forma unfolded e desenată la scară 1:1 (1 px = 1 unitate), centrată pe centroidul
     footprint-ului feței, astfel încât să corespundă cu poziția pe plan.
+    Fețele degenerate (arie foarte mică, linie subțire) sunt omise.
     Output: unfold/{face_num}.png (face_num = 1, 2, 3, ... conform faces.png).
     """
     if cv2 is None:
@@ -193,7 +200,12 @@ def generate_unfold_masks_for_roof_types(
         res = _unfold_face_to_2d(verts)
         if res is None:
             continue
-        poly_2d, _width, _height = res
+        poly_2d, width, height = res
+        if width < 1e-6 or height < 1e-6:
+            continue
+        aspect = min(width, height) / max(width, height)
+        if aspect < _MIN_UNFOLD_ASPECT:
+            continue
         cx, cy, _ = _face_centroid(verts)
         cu = sum(p[0] for p in poly_2d) / len(poly_2d)
         cv = sum(p[1] for p in poly_2d) / len(poly_2d)
@@ -205,6 +217,9 @@ def generate_unfold_masks_for_roof_types(
         canvas = np.zeros((plan_h, plan_w), dtype=np.uint8)
         if pts_int.size >= 6:
             cv2.fillPoly(canvas, [pts_int], 255)
+        area_px = int(np.count_nonzero(canvas))
+        if area_px < _MIN_UNFOLD_AREA_PX:
+            continue
         png_path = output_dir / f"{face_idx}.png"
         cv2.imwrite(str(png_path), canvas)
         count += 1
