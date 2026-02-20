@@ -2,7 +2,7 @@
 """
 Workflow curat:
 - output/rectangles/floor_X/ - măști dreptunghiuri rămase (după eliminare suprapuneri)
-- output/roof_types/floor_X/{1_w,2_w,4_w,4.5_w}/ - lines.png, faces.png, frame.html per tip
+- output/roof_types/floor_X/{0_w,1_w,2_w,4_w,4.5_w}/ - lines.png, faces.png, frame.html per tip
 """
 
 import json
@@ -49,8 +49,54 @@ def _translate_sections(sections: list, dx: float, dy: float) -> list:
     return out
 
 
+def _polygon_to_mask(poly, width: int, height: int):
+    """Rasterizează un poligon Shapely la mască binară (height, width). Coordonatele poly sunt în (x,y) = (col, row)."""
+    import numpy as np
+    if poly is None or getattr(poly, "is_empty", True):
+        return np.zeros((height, width), dtype=np.uint8)
+    try:
+        coords = []
+        if hasattr(poly, "exterior") and poly.exterior is not None:
+            coords = list(poly.exterior.coords)
+        if not coords:
+            return np.zeros((height, width), dtype=np.uint8)
+        pts = np.array([[float(x), float(y)] for x, y in coords], dtype=np.int32)
+        pts = np.clip(pts, [0, 0], [width - 1, height - 1])
+        pts = pts.reshape(-1, 1, 2)
+        mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillPoly(mask, [pts], 255)
+        return mask
+    except Exception:
+        return np.zeros((height, width), dtype=np.uint8)
+
+
+def _overlap_area_at_offset(
+    ref_mask, ref_w: int, ref_h: int,
+    other_mask, other_w: int, other_h: int,
+    dx: int, dy: int,
+) -> int:
+    """
+    Suprafața suprapusă (în pixeli) când etajul 'other' e translat cu (dx, dy) în coordonatele etajului de referință.
+    ref_mask: (ref_h, ref_w), other_mask: (other_h, other_w).
+    """
+    x_lo = max(0, dx)
+    x_hi = min(ref_w, dx + other_w)
+    y_lo = max(0, dy)
+    y_hi = min(ref_h, dy + other_h)
+    if x_lo >= x_hi or y_lo >= y_hi:
+        return 0
+    ref_crop = ref_mask[y_lo:y_hi, x_lo:x_hi]
+    other_crop = other_mask[y_lo - dy : y_hi - dy, x_lo - dx : x_hi - dx]
+    if ref_crop.shape != other_crop.shape:
+        return 0
+    return int(((ref_crop > 0) & (other_crop > 0)).sum())
+
+
 def _compute_overlay_offsets(floor_paths: List[str], roof_results: List[dict]) -> dict:
-    """Offsets pentru alinierea etajelor (centroid / dreptunghi comun)."""
+    """
+    Offsets pentru alinierea etajelor. Când dreptunghiurile nu au aceeași suprafață,
+    alege (dx, dy) care maximizează suprafața suprapusă (brute force pe un grid de offset-uri).
+    """
     from roof_calc.flood_fill import flood_fill_interior, get_house_shape_mask
     from roof_calc.geometry import extract_polygon
 
@@ -85,6 +131,14 @@ def _compute_overlay_offsets(floor_paths: List[str], roof_results: List[dict]) -
             if a > best_a:
                 best_a = a
                 best_i = i
+
+    # Măști și dimensiuni pentru referință și pentru brute force
+    ref_path = floor_paths[best_i]
+    ref_img = cv2.imread(ref_path, cv2.IMREAD_GRAYSCALE)
+    ref_h, ref_w = (ref_img.shape[0], ref_img.shape[1]) if ref_img is not None else (0, 0)
+    ref_mask = _polygon_to_mask(polys[best_i], ref_w, ref_h) if ref_w and ref_h else None
+
+    # Dacă nu avem mască validă pentru referință, folosim fallback centroid (comportament vechi)
     cx_ref, cy_ref = 0.0, 0.0
     rr_ref = roof_results[best_i] if best_i < len(roof_results) else {}
     for s in rr_ref.get("sections") or []:
@@ -101,27 +155,69 @@ def _compute_overlay_offsets(floor_paths: List[str], roof_results: List[dict]) -
             out[p] = (0, 0)
             continue
         rr = roof_results[i] if i < len(roof_results) else {}
-        found = False
-        for s in rr.get("sections") or []:
-            if _sec_area(s) <= 0:
-                continue
-            for s_ref in rr_ref.get("sections") or []:
-                if _sec_area(s_ref) <= 0:
+        other_img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+        other_h, other_w = (other_img.shape[0], other_img.shape[1]) if other_img is not None else (0, 0)
+        other_mask = _polygon_to_mask(polys[i], other_w, other_h) if other_w and other_h else None
+
+        use_brute_force = (
+            ref_mask is not None
+            and other_mask is not None
+            and ref_mask.any()
+            and other_mask.any()
+        )
+        if use_brute_force:
+            # Interval și pas pentru brute force (în pixeli)
+            step = max(1, min(ref_w, ref_h, other_w, other_h) // 50)
+            range_x = min(200, max(50, (min(ref_w, other_w) + 1) // 2))
+            range_y = min(200, max(50, (min(ref_h, other_h) + 1) // 2))
+            best_overlap = -1
+            best_dx, best_dy = 0, 0
+            for dx in range(-range_x, range_x + 1, step):
+                for dy in range(-range_y, range_y + 1, step):
+                    overlap = _overlap_area_at_offset(
+                        ref_mask, ref_w, ref_h,
+                        other_mask, other_w, other_h,
+                        dx, dy,
+                    )
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_dx, best_dy = dx, dy
+            # Rafinare: pas mai fin în jurul (best_dx, best_dy)
+            if step > 1:
+                for dx in range(best_dx - step, best_dx + step + 1):
+                    for dy in range(best_dy - step, best_dy + step + 1):
+                        overlap = _overlap_area_at_offset(
+                            ref_mask, ref_w, ref_h,
+                            other_mask, other_w, other_h,
+                            dx, dy,
+                        )
+                        if overlap > best_overlap:
+                            best_overlap = overlap
+                            best_dx, best_dy = dx, dy
+            out[p] = (best_dx, best_dy)
+        else:
+            # Fallback: aliniere după centroid sau dreptunghi comun (comportament vechi)
+            found = False
+            for s in rr.get("sections") or []:
+                if _sec_area(s) <= 0:
                     continue
-                if min(_sec_area(s), _sec_area(s_ref)) / max(_sec_area(s), _sec_area(s_ref)) >= 0.9:
-                    cxi, cyi = _sec_center(s)
-                    out[p] = (int(round(cx_ref - cxi)), int(round(cy_ref - cyi)))
-                    found = True
+                for s_ref in rr_ref.get("sections") or []:
+                    if _sec_area(s_ref) <= 0:
+                        continue
+                    if min(_sec_area(s), _sec_area(s_ref)) / max(_sec_area(s), _sec_area(s_ref)) >= 0.9:
+                        cxi, cyi = _sec_center(s)
+                        out[p] = (int(round(cx_ref - cxi)), int(round(cy_ref - cyi)))
+                        found = True
+                        break
+                if found:
                     break
-            if found:
-                break
-        if not found:
-            poly = polys[i] if i < len(polys) else None
-            if poly is None or getattr(poly, "is_empty", True):
-                out[p] = (0, 0)
-            else:
-                c = poly.centroid
-                out[p] = (int(round(cx_ref - c.x)), int(round(cy_ref - cy.y)))
+            if not found:
+                poly = polys[i] if i < len(polys) else None
+                if poly is None or getattr(poly, "is_empty", True):
+                    out[p] = (0, 0)
+                else:
+                    c = poly.centroid
+                    out[p] = (int(round(cx_ref - c.x)), int(round(cy_ref - c.y)))
     return out
 
 
@@ -135,6 +231,16 @@ def detect_floors_from_folder(folder_path: str) -> Tuple[List[str], Optional[str
         return [], None
     if len(paths) == 1:
         return paths, paths[0]
+    # Păstrăm ordinea engine: floor_00, floor_01, ... (beci = 0 la baza 3D)
+    import re
+    def _floor_index(path: str) -> int:
+        stem = Path(path).stem.lower()
+        m = re.match(r"floor_?(\d+)", stem)
+        return int(m.group(1)) if m else 999
+    matching = [p for p in paths if _floor_index(p) != 999]
+    if matching:
+        matching.sort(key=_floor_index)
+        return matching, matching[0]
     sizes = [(p, cv2.imread(p, cv2.IMREAD_GRAYSCALE)) for p in paths]
     sizes = [(p, img.shape[0] * img.shape[1] if img is not None else 0) for p, img in sizes]
     sizes.sort(key=lambda x: x[1])
@@ -267,6 +373,15 @@ def run_clean_workflow(wall_mask_path: str, output_dir: str = "output") -> None:
         json.dumps(floors_info, indent=0), encoding="utf-8"
     )
 
+    basement_floor_index: Optional[int] = None
+    bfi_path = output_path / "basement_floor_index.json"
+    if bfi_path.exists():
+        try:
+            bfi_data = json.loads(bfi_path.read_text(encoding="utf-8"))
+            basement_floor_index = bfi_data.get("basement_floor_index")
+        except Exception:
+            pass
+
     for floor_idx, floor_path, remaining in floors_to_output:
         res = path_to_result.get(floor_path)
         if res is None:
@@ -299,22 +414,25 @@ def run_clean_workflow(wall_mask_path: str, output_dir: str = "output") -> None:
 
         roof_floor_dir = roof_types_dir / f"floor_{floor_idx}"
         roof_floor_dir.mkdir(parents=True, exist_ok=True)
-        roof_angle_floor = floor_roof_angles.get(floor_idx, default_angle)
-        try:
-            generate_roof_type_outputs(
-                floor_path,
-                filtered_result,
-                remaining,
-                roof_floor_dir,
-                roof_angle_deg=roof_angle_floor,
-                wall_height=300.0,
-                upper_floor_sections=upper_sections if upper_sections else None,
-            )
-            print(f"   ✓ roof_types/floor_{floor_idx}/: 1_w, 2_w, 4_w, 4.5_w (lines.png, faces.png, frame.html, unfold/)")
-        except Exception as e:
-            print(f"   ⚠ roof_types/floor_{floor_idx}: {e}")
+        if floor_idx == basement_floor_index:
+            print(f"   ○ roof_types/floor_{floor_idx}/: beci – fără acoperiș")
+        else:
+            roof_angle_floor = floor_roof_angles.get(floor_idx, default_angle)
+            try:
+                generate_roof_type_outputs(
+                    floor_path,
+                    filtered_result,
+                    remaining,
+                    roof_floor_dir,
+                    roof_angle_deg=roof_angle_floor,
+                    wall_height=300.0,
+                    upper_floor_sections=upper_sections if upper_sections else None,
+                )
+                print(f"   ✓ roof_types/floor_{floor_idx}/: 0_w, 1_w, 2_w, 4_w, 4.5_w (lines.png, faces.png, frame.html, unfold/)")
+            except Exception as e:
+                print(f"   ⚠ roof_types/floor_{floor_idx}: {e}")
 
-    for rt in ("1_w", "2_w", "4_w", "4.5_w"):
+    for rt in ("0_w", "1_w", "2_w", "4_w", "4.5_w"):
         try:
             generate_entire_frame_html(
                 roof_types_dir,
@@ -331,7 +449,8 @@ def run_clean_workflow(wall_mask_path: str, output_dir: str = "output") -> None:
     if frt_path.exists():
         try:
             data = json.loads(frt_path.read_text(encoding="utf-8"))
-            floor_roof_types = {int(k): str(v) for k, v in (data or {}).items()}
+            # Păstrăm None pentru etajul beci (fără acoperiș)
+            floor_roof_types = {int(k): (v if v is not None else None) for k, v in (data or {}).items()}
         except Exception:
             pass
     if floor_roof_types:
@@ -357,8 +476,8 @@ def run_clean_workflow(wall_mask_path: str, output_dir: str = "output") -> None:
 
     print("\n✅ Workflow curat finalizat.")
     print(f"   - {rectangles_dir}/floor_X/ - măști dreptunghiuri")
-    print(f"   - {roof_types_dir}/floor_X/{{1_w,2_w,4_w,4.5_w}}/ - lines.png, faces.png, frame.html")
-    print(f"   - {output_path}/entire/{{1_w,2_w,4_w,4.5_w}}/ - frame.html, filled.html")
+    print(f"   - {roof_types_dir}/floor_X/{{0_w,1_w,2_w,4_w,4.5_w}}/ - lines.png, faces.png, frame.html")
+    print(f"   - {output_path}/entire/{{0_w,1_w,2_w,4_w,4.5_w}}/ - frame.html, filled.html")
 
 
 if __name__ == "__main__":

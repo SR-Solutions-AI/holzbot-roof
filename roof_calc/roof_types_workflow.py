@@ -1,6 +1,6 @@
 """
-Workflow curat: rectangles (cu eliminare suprapuneri) + roof_types (1_w, 2_w, 4_w, 4.5_w).
-Fiecare tip: lines.png + faces.png.
+Workflow curat: rectangles (cu eliminare suprapuneri) + roof_types (0_w, 1_w, 2_w, 4_w, 4.5_w).
+0_w = plat; 1_w = o apă; 2_w = două ape; 4_w = hip; 4.5_w = half-hip. Fiecare tip: lines.png + faces.png.
 """
 
 from __future__ import annotations
@@ -495,6 +495,54 @@ def _get_contour_segments_from_sections(sections: List[Dict[str, Any]], shape: T
         return []
     mask = generate_binary_mask(rects, shape)
     return _get_contour_segments(mask)
+
+
+def _get_separator_segments(sections: List[Dict[str, Any]]) -> List[List[List[float]]]:
+    """
+    Segmente care despart dreptunghiuri lipite (același etaj): muchia comună între două
+    bounding_rect care se ating. Permite două fețe separate și trasarea liniei de despărțire.
+    """
+    out: List[List[List[float]]] = []
+    polys: List[Any] = []
+    for sec in sections:
+        poly = _rect_polygon(sec)
+        if poly is not None and not poly.is_empty:
+            polys.append(poly)
+        else:
+            polys.append(None)
+    tol = 1e-6
+    seen: set = set()
+    for i in range(len(polys)):
+        if polys[i] is None:
+            continue
+        for j in range(i + 1, len(polys)):
+            if polys[j] is None:
+                continue
+            try:
+                bi = getattr(polys[i], "boundary", None)
+                bj = getattr(polys[j], "boundary", None)
+                if bi is None or bj is None:
+                    continue
+                inter = bi.intersection(bj)
+                if inter is None or getattr(inter, "is_empty", True):
+                    continue
+                geoms = getattr(inter, "geoms", None) or ([inter] if inter else [])
+                for g in geoms:
+                    coords = list(getattr(g, "coords", []))
+                    if len(coords) < 2:
+                        continue
+                    p0 = (round(float(coords[0][0]), 6), round(float(coords[0][1]), 6))
+                    p1 = (round(float(coords[-1][0]), 6), round(float(coords[-1][1]), 6))
+                    if (p0[0] - p1[0]) ** 2 + (p0[1] - p1[1]) ** 2 < tol * tol:
+                        continue
+                    key = (p0, p1) if p0 < p1 else (p1, p0)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append([[float(coords[0][0]), float(coords[0][1])], [float(coords[-1][0]), float(coords[-1][1])]])
+            except Exception:
+                pass
+    return out
 
 
 def _split_brown_segments_no_containment(
@@ -2159,9 +2207,9 @@ def _faces_from_segments(
     if floor_poly is None or floor_poly.is_empty:
         return []
 
-    secs = _sections_for_1w_shed(sections) if roof_type == "1_w" else sections
+    secs = _sections_for_1w_shed(sections) if roof_type in ("0_w", "1_w") else sections
     corner_lines = None
-    if roof_type != "1_w" and _has_ridge_intersection(sections):
+    if roof_type not in ("0_w", "1_w") and _has_ridge_intersection(sections):
         from roof_calc.overhang import ridge_intersection_corner_lines
         corner_lines = ridge_intersection_corner_lines(sections, per_section=False)
 
@@ -2301,7 +2349,7 @@ def _generate_frame_html(subdir: Path, wall_height: float = 300.0) -> None:
             if len(p) >= 2:
                 upper_rect_pts.append((float(p[0]), float(p[1])))
     best_contour_d2: Optional[float] = None
-    if roof_type_frame == "1_w" and has_upper_floor and upper_rect_pts and contour_segs_list:
+    if roof_type_frame in ("0_w", "1_w") and has_upper_floor and upper_rect_pts and contour_segs_list:
         best_contour_d2 = 1e30
         for cseg in contour_segs_list:
             pts = cseg if isinstance(cseg, (list, tuple)) and cseg and isinstance(cseg[0], (list, tuple)) else []
@@ -2313,7 +2361,7 @@ def _generate_frame_html(subdir: Path, wall_height: float = 300.0) -> None:
         best_contour_d2 = (best_contour_d2 or 0) + 100
 
     def _point_on_contour_near_yellow(px: float, py: float, tol: float = 5.0) -> bool:
-        if not upper_rect_pts or roof_type_frame != "1_w" or not has_upper_floor or best_contour_d2 is None:
+        if not upper_rect_pts or roof_type_frame not in ("0_w", "1_w") or not has_upper_floor or best_contour_d2 is None:
             return False
         pt = (px, py)
         for cseg in contour_segs_list:
@@ -2329,6 +2377,7 @@ def _generate_frame_html(subdir: Path, wall_height: float = 300.0) -> None:
         return False
 
     def z_fn_contour(x: float, y: float) -> float:
+        # Pentru 0_w (plat) nu ridicăm niciun segment verde – toate la nivelul cel mai de jos
         if roof_type_frame == "1_w" and has_upper_floor and _point_on_contour_near_yellow(x, y):
             return wh + 0.5 * wh
         return wh
@@ -2505,7 +2554,7 @@ def generate_frames_for_roof_types_dir(base_dir: Path, wall_height: float = 300.
     Generează frame.html pentru toate subfolderele de tip acoperiș (1_w, 2_w, 4_w, 4.5_w)
     dintr-un director. Util pentru output-uri existente.
     """
-    for name in ("1_w", "2_w", "4_w", "4.5_w"):
+    for name in ("0_w", "1_w", "2_w", "4_w", "4.5_w"):
         subdir = base_dir / name
         if subdir.is_dir() and (subdir / "faces_faces.json").exists():
             try:
@@ -2552,7 +2601,7 @@ def generate_entire_frame_html(
         for floor_dir in floor_dirs:
             fidx = int(floor_dir.name.split("_")[1]) if floor_dir.name.split("_")[1].isdigit() else 0
             rt = floor_roof_types.get(fidx)
-            if not rt or rt not in ("1_w", "2_w", "4_w", "4.5_w"):
+            if not rt or rt not in ("0_w", "1_w", "2_w", "4_w", "4.5_w"):
                 continue
             ff_path = floor_dir / rt / "faces_faces.json"
             if ff_path.exists():
@@ -2666,7 +2715,7 @@ def generate_entire_frame_html(
 
         best_contour_d2_entire: Optional[float] = None
         contour_segs_entire = segs_data.get("contour") or []
-        if rt_floor == "1_w" and has_upper and upper_rect_pts_entire and contour_segs_entire:
+        if rt_floor in ("0_w", "1_w") and has_upper and upper_rect_pts_entire and contour_segs_entire:
             def _min_d2_early(pt, lst):
                 if not lst:
                     return 1e30
@@ -2681,7 +2730,7 @@ def generate_entire_frame_html(
             best_contour_d2_entire = (best_contour_d2_entire or 0) + 100
 
         def _point_on_contour_near_yellow_entire(px: float, py: float, tol: float = 3.0) -> bool:
-            if not upper_rect_pts_entire or rt_floor != "1_w" or not has_upper or best_contour_d2_entire is None:
+            if not upper_rect_pts_entire or rt_floor not in ("0_w", "1_w") or not has_upper or best_contour_d2_entire is None:
                 return False
             pt = (px, py)
             for cseg in contour_segs_entire:
@@ -2697,6 +2746,7 @@ def generate_entire_frame_html(
             return False
 
         def _z_fn_contour(x, y):
+            # Pentru 0_w (plat) nu ridicăm niciun segment verde – toate la nivelul cel mai de jos
             if rt_floor == "1_w" and has_upper and _point_on_contour_near_yellow_entire(x, y):
                 return fwh + 0.5 * fwh + z_off
             return fwh + z_off
@@ -2795,6 +2845,7 @@ def generate_entire_frame_html(
             fig.add_trace(go.Scatter3d(x=lx, y=ly, z=lz, mode="lines", line=ld, name=lbl, legendgroup=lbl))
 
         _z_fn_pyramid_use = _z_fn_pyramid if rt_floor in ("4_w", "2_w") else _z_fn_between
+        # Nu randăm segmente galbene (upper_rect / Etaj superior) în 3D
         seg_cfg = [
             ("contour", "green", "Contur exterior", 2, None, _z_fn_contour, False),
             ("ridge", "darkred", "Ridge", 2.5, None, _z_fn_ridge, False),
@@ -2802,7 +2853,6 @@ def generate_entire_frame_html(
             ("blue", "blue", "Segment albastru", 2.5, None, _z_fn_between, False),
             ("pyramid", "blue", "Diagonale 45°", 1.5, "dash", _z_fn_pyramid_use, True),
             ("orange", "orange", "Paralelă diagonale", 2, None, _z_fn_orange, False),
-            ("upper_rect", "yellow", "Etaj superior", 2, None, _z_fn_orange, False),
             ("wall_support", "deepskyblue", "Suport perete", 2, None, _z_fn_between, False),
             ("brown", "saddlebrown", "Laturi opuse", 2.5, None, _z_fn_between, False),
         ]
@@ -2810,28 +2860,6 @@ def generate_entire_frame_html(
             segs = segs_data.get(key) or []
             lx, ly, lz = _seg_to_plotly(segs, z_fn, endpoints_only=ep)
             _add_trace(lx, ly, lz, color, name, width=width, dash=dash)
-            if key == "upper_rect" and segs and contour_pts_for_z:
-                seen_upper_pt = set()
-                for seg in segs:
-                    pts = seg if isinstance(seg, (list, tuple)) and seg and isinstance(seg[0], (list, tuple)) else []
-                    for p in pts:
-                        if len(p) < 2:
-                            continue
-                        x, y = float(p[0]), float(p[1])
-                        k = (round(x, 1), round(y, 1))
-                        if k in seen_upper_pt:
-                            continue
-                        d = _min_dist_sq((x, y), contour_pts_for_z)
-                        if d > 500:
-                            continue
-                        seen_upper_pt.add(k)
-                        z_top = z_fn(x, y)
-                        lx_v = [x + dx_off, x + dx_off, None]
-                        ly_v = [y + dy_off, y + dy_off, None]
-                        lz_v = [fwh + z_off, z_top, None]
-                        lbl = "Etaj superior (pereți)" if len(floor_payloads) <= 1 else f"Etaj superior (pereți) (etaj {floor_idx})"
-                        fig.add_trace(go.Scatter3d(x=lx_v, y=ly_v, z=lz_v, mode="lines",
-                            line=dict(color="yellow", width=1), name=lbl, legendgroup=lbl))
 
         for pts in (markers_data.get("ridge_midpoints") or []):
             if pts and len(pts) >= 2:
@@ -3007,7 +3035,7 @@ def generate_entire_frame_html(
                 if len(p) >= 2:
                     upper_rect_pts_filled.append((float(p[0]), float(p[1])))
         best_contour_d2_filled: Optional[float] = None
-        if rt_floor == "1_w" and has_upper_filled and upper_rect_pts_filled and contour_segs_filled:
+        if rt_floor in ("0_w", "1_w") and has_upper_filled and upper_rect_pts_filled and contour_segs_filled:
             best_contour_d2_filled = 1e30
             for cseg in contour_segs_filled:
                 pts = cseg if isinstance(cseg, (list, tuple)) and cseg and isinstance(cseg[0], (list, tuple)) else []
@@ -3018,7 +3046,7 @@ def generate_entire_frame_html(
             best_contour_d2_filled = (best_contour_d2_filled or 0) + 100
 
         def _point_on_contour_near_yellow_filled(px: float, py: float, tol: float = 5.0) -> bool:
-            if not upper_rect_pts_filled or rt_floor != "1_w" or not has_upper_filled or best_contour_d2_filled is None:
+            if not upper_rect_pts_filled or rt_floor not in ("0_w", "1_w") or not has_upper_filled or best_contour_d2_filled is None:
                 return False
             pt = (px, py)
             for cseg in contour_segs_filled:
@@ -3058,6 +3086,9 @@ def generate_entire_frame_html(
             return False
 
         def _z_fn(x: float, y: float) -> float:
+            # Pentru 0_w (plat) tot acoperișul la același nivel – niciun colț ridicat
+            if rt_floor == "0_w":
+                return fwh + z_off
             if rt_floor == "1_w" and has_upper_filled and _point_on_contour_near_yellow_filled(x, y):
                 return fwh + 0.5 * fwh + z_off
             if rt_floor == "4.5_w" and orange_segs:
@@ -3128,6 +3159,7 @@ def generate_entire_frame_html(
             poly_idx += 1
             xs = [float(p[0]) + dx_off for p in poly]
             ys = [float(p[1]) + dy_off for p in poly]
+            # Doar pentru 1_w ridicăm muchia lipită de etajul superior; pentru 0_w totul rămâne plat
             if rt_floor == "1_w" and has_upper_filled and upper_rect_pts_filled:
                 best_edge_idx = -1
                 best_overlap = -1.0
@@ -3360,8 +3392,8 @@ def generate_roof_type_outputs(
     upper_floor_sections: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """
-    Generează lines.png și faces.png pentru 1_w, 2_w, 4_w, 4.5_w.
-    Conturul exterior = dreptunghiurile curente. Etajul superior = galben (dacă e dat).
+    Generează lines.png și faces.png pentru 0_w, 1_w, 2_w, 4_w, 4.5_w.
+    0_w = acoperiș plat (ca 1_w dar cu unghi 0). Conturul exterior = dreptunghiurile curente.
     """
     img = cv2.imread(wall_mask_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
@@ -3369,12 +3401,21 @@ def generate_roof_type_outputs(
 
     h, w = img.shape[:2]
     contour_segs = _get_contour_segments_from_sections(sections, (h, w))
+    seg_separator = _get_separator_segments(sections)
+    # Segmente care despart dreptunghiuri lipite (două fețe separate + linie de despărțire)
+    contour_segs = list(contour_segs) + list(seg_separator)
     contour_segs_45w_green, contour_segs_45w_pink = _get_contour_segments_45w_chamfered(
         sections, (h, w), upper_floor_sections
     )
     upper_rect_segs = _get_upper_rect_segments(upper_floor_sections or [])
 
     roof_types_config = {
+        "0_w": {
+            "ridge": False,
+            "magenta": False,
+            "blue": True,
+            "pyramid": False,
+        },
         "1_w": {
             "ridge": False,
             "magenta": False,
@@ -3428,7 +3469,8 @@ def generate_roof_type_outputs(
         )
         seg_magenta = magenta_segs if config["magenta"] else []
         seg_blue = blue_segs if config["blue"] else []
-        seg_contour = contour_segs_45w_green if roof_type == "4.5_w" else contour_segs
+        seg_contour = (contour_segs_45w_green if roof_type == "4.5_w" else contour_segs)
+        seg_contour = list(seg_contour) + list(seg_separator)
         seg_pyramid_3d = list(seg_pyramid)  # pentru 3D: diagonale cu 2 capete
         brown_endpoint_markers: Optional[List[Tuple[Tuple[float, float], int]]] = None
         seg_brown: Optional[List[List[List[float]]]] = None
@@ -3552,7 +3594,7 @@ def generate_roof_type_outputs(
         )
 
         all_seg_lists = [seg_ridge, seg_contour, seg_magenta, seg_blue, seg_pyramid]
-        if roof_type == "1_w":
+        if roof_type in ("0_w", "1_w"):
             all_seg_lists = [seg_ridge, seg_contour, seg_magenta, seg_pyramid]
         if seg_orange:
             all_seg_lists.append(seg_orange)
@@ -3564,9 +3606,10 @@ def generate_roof_type_outputs(
             *all_seg_lists,
             exclude_interior_of=upper_rect_segs if upper_rect_segs else None,
         )
+        effective_angle = 0.0 if roof_type == "0_w" else roof_angle_deg
         faces_data = _faces_from_segments(
             roof_type, sections, img,
-            wall_height=wall_height, roof_angle_deg=roof_angle_deg,
+            wall_height=wall_height, roof_angle_deg=effective_angle,
         )
         _draw_faces_png(img, polygons_2d, subdir / "faces.png", roof_type=roof_type, seed=hash(roof_type) % (2**32))
 
@@ -3591,7 +3634,7 @@ def generate_roof_type_outputs(
                 "faces": [{"vertices_3d": f.get("vertices_3d", [])} for f in faces_data],
                 "polygons_2d": polygons_2d_serial,
                 "wall_height": wall_height,
-                "roof_angle_deg": roof_angle_deg,
+                "roof_angle_deg": effective_angle,
                 "has_upper_floor": bool(upper_floor_sections),
                 "segments": {
                     "ridge": [_seg_to_xy(seg) for seg in seg_ridge if len(seg) >= 2],

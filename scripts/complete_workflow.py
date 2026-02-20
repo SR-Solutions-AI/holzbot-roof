@@ -527,6 +527,52 @@ def _polygon_from_path_for_offset(path: str) -> Optional[Any]:
     return poly
 
 
+def _polygon_to_mask(poly: Any, width: int, height: int):
+    """Rasterizează un poligon Shapely la mască binară (height, width)."""
+    import numpy as np
+
+    if poly is None or getattr(poly, "is_empty", True):
+        return np.zeros((height, width), dtype=np.uint8)
+    try:
+        coords = []
+        if hasattr(poly, "exterior") and poly.exterior is not None:
+            coords = list(poly.exterior.coords)
+        if not coords:
+            return np.zeros((height, width), dtype=np.uint8)
+        pts = np.array([[float(x), float(y)] for x, y in coords], dtype=np.int32)
+        pts = np.clip(pts, [0, 0], [width - 1, height - 1])
+        pts = pts.reshape(-1, 1, 2)
+        mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillPoly(mask, [pts], 255)
+        return mask
+    except Exception:
+        return np.zeros((height, width), dtype=np.uint8)
+
+
+def _overlap_area_at_offset(
+    ref_mask: Any,
+    ref_w: int,
+    ref_h: int,
+    other_mask: Any,
+    other_w: int,
+    other_h: int,
+    dx: int,
+    dy: int,
+) -> int:
+    """Suprafața suprapusă (pixeli) când other e translat cu (dx, dy) în coord. referință."""
+    x_lo = max(0, dx)
+    x_hi = min(ref_w, dx + other_w)
+    y_lo = max(0, dy)
+    y_hi = min(ref_h, dy + other_h)
+    if x_lo >= x_hi or y_lo >= y_hi:
+        return 0
+    ref_crop = ref_mask[y_lo:y_hi, x_lo:x_hi]
+    other_crop = other_mask[y_lo - dy : y_hi - dy, x_lo - dx : x_hi - dx]
+    if ref_crop.shape != other_crop.shape:
+        return 0
+    return int(((ref_crop > 0) & (other_crop > 0)).sum())
+
+
 def _section_rect_center(sec: dict) -> Tuple[float, float]:
     br = sec.get("bounding_rect") or []
     if len(br) < 3:
@@ -547,8 +593,8 @@ def _section_area(sec: dict) -> float:
 
 def _compute_overlay_offsets(floor_paths: List[str], roof_results: List[dict]) -> dict:
     """
-    Aliniază etajele după dreptunghiul comun (același pe ambele etaje).
-    Dacă nu există dreptunghi comun, folosește centroidul celui mai mare etaj.
+    Aliniază etajele. Când dreptunghiurile nu au aceeași suprafață, alege (dx, dy)
+    care maximizează suprafața suprapusă (brute force pe un grid de offset-uri).
     """
     polys = [_polygon_from_path_for_offset(p) for p in floor_paths]
     best_idx = 0
@@ -559,66 +605,89 @@ def _compute_overlay_offsets(floor_paths: List[str], roof_results: List[dict]) -
             if a > best_area:
                 best_area = a
                 best_idx = i
-    cx_ref, cy_ref = 0.0, 0.0
     ref_path = floor_paths[best_idx] if best_idx < len(floor_paths) else floor_paths[0]
-    if len(floor_paths) >= 2 and len(roof_results) >= 2:
-        rr_ref = roof_results[best_idx]
-        for other_idx, (p_oth, rr_oth) in enumerate(zip(floor_paths, roof_results)):
-            if other_idx == best_idx:
-                continue
-            for s_ref in rr_ref.get("sections") or []:
-                a_ref = _section_area(s_ref)
-                if a_ref <= 0:
-                    continue
-                for s_oth in rr_oth.get("sections") or []:
-                    a_oth = _section_area(s_oth)
-                    if a_oth <= 0:
-                        continue
-                    if min(a_ref, a_oth) / max(a_ref, a_oth) >= 0.9:
-                        cx_ref, cy_ref = _section_rect_center(s_ref)
-                        break
-                if cx_ref != 0 or cy_ref != 0:
-                    break
-            if cx_ref != 0 or cy_ref != 0:
-                break
+    rr_ref = roof_results[best_idx] if best_idx < len(roof_results) else {}
+    cx_ref, cy_ref = 0.0, 0.0
+    for s in rr_ref.get("sections") or []:
+        if _section_area(s) > 0:
+            cx_ref, cy_ref = _section_rect_center(s)
+            break
     if cx_ref == 0 and cy_ref == 0:
         ref_poly = polys[best_idx] if best_idx < len(polys) else None
         if ref_poly and not ref_poly.is_empty:
             c = ref_poly.centroid
             cx_ref, cy_ref = float(c.x), float(c.y)
+
+    ref_img = cv2.imread(ref_path, cv2.IMREAD_GRAYSCALE)
+    ref_h, ref_w = (ref_img.shape[0], ref_img.shape[1]) if ref_img is not None else (0, 0)
+    ref_mask = _polygon_to_mask(polys[best_idx], ref_w, ref_h) if ref_w and ref_h else None
+
     out = {}
-    for p, poly in zip(floor_paths, polys):
+    for i, p in enumerate(floor_paths):
         if p == ref_path:
             out[p] = (0, 0)
             continue
-        found = False
-        if p in floor_paths:
-            pi = floor_paths.index(p)
-            if pi < len(roof_results):
-                rr_p = roof_results[pi]
-                rr_ref = roof_results[best_idx] if best_idx < len(roof_results) else None
-                if rr_ref:
-                    for s_p in rr_p.get("sections") or []:
-                        a_p = _section_area(s_p)
-                        if a_p <= 0:
-                            continue
-                        for s_ref in rr_ref.get("sections") or []:
-                            a_ref = _section_area(s_ref)
-                            if a_ref <= 0:
-                                continue
-                            if min(a_p, a_ref) / max(a_p, a_ref) >= 0.9:
-                                cxi, cyi = _section_rect_center(s_p)
-                                out[p] = (int(round(cx_ref - cxi)), int(round(cy_ref - cyi)))
-                                found = True
-                                break
-                        if found:
-                            break
-        if not found:
-            if poly is None or poly.is_empty:
-                out[p] = (int(round(-cx_ref)), int(round(-cy_ref)))
-            else:
-                c = poly.centroid
-                out[p] = (int(round(cx_ref - c.x)), int(round(cy_ref - c.y)))
+        poly = polys[i] if i < len(polys) else None
+        other_img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+        other_h, other_w = (other_img.shape[0], other_img.shape[1]) if other_img is not None else (0, 0)
+        other_mask = _polygon_to_mask(poly, other_w, other_h) if other_w and other_h else None
+
+        use_brute_force = (
+            ref_mask is not None
+            and other_mask is not None
+            and ref_mask.any()
+            and other_mask.any()
+        )
+        if use_brute_force:
+            step = max(1, min(ref_w, ref_h, other_w, other_h) // 50)
+            range_x = min(200, max(50, (min(ref_w, other_w) + 1) // 2))
+            range_y = min(200, max(50, (min(ref_h, other_h) + 1) // 2))
+            best_overlap = -1
+            best_dx, best_dy = 0, 0
+            for dx in range(-range_x, range_x + 1, step):
+                for dy in range(-range_y, range_y + 1, step):
+                    overlap = _overlap_area_at_offset(
+                        ref_mask, ref_w, ref_h,
+                        other_mask, other_w, other_h,
+                        dx, dy,
+                    )
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_dx, best_dy = dx, dy
+            if step > 1:
+                for dx in range(best_dx - step, best_dx + step + 1):
+                    for dy in range(best_dy - step, best_dy + step + 1):
+                        overlap = _overlap_area_at_offset(
+                            ref_mask, ref_w, ref_h,
+                            other_mask, other_w, other_h,
+                            dx, dy,
+                        )
+                        if overlap > best_overlap:
+                            best_overlap = overlap
+                            best_dx, best_dy = dx, dy
+            out[p] = (best_dx, best_dy)
+        else:
+            found = False
+            rr_p = roof_results[i] if i < len(roof_results) else {}
+            for s_p in rr_p.get("sections") or []:
+                if _section_area(s_p) <= 0:
+                    continue
+                for s_ref in rr_ref.get("sections") or []:
+                    if _section_area(s_ref) <= 0:
+                        continue
+                    if min(_section_area(s_p), _section_area(s_ref)) / max(_section_area(s_p), _section_area(s_ref)) >= 0.9:
+                        cxi, cyi = _section_rect_center(s_p)
+                        out[p] = (int(round(cx_ref - cxi)), int(round(cy_ref - cyi)))
+                        found = True
+                        break
+                if found:
+                    break
+            if not found:
+                if poly is None or poly.is_empty:
+                    out[p] = (int(round(-cx_ref)), int(round(-cy_ref)))
+                else:
+                    c = poly.centroid
+                    out[p] = (int(round(cx_ref - c.x)), int(round(cy_ref - c.y)))
     return out
 
 

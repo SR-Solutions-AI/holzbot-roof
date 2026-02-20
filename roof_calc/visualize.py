@@ -430,28 +430,39 @@ def _ordered_floor_polygons(  # type: ignore[override]
     import cv2  # local import
     import numpy as np
     from shapely import affinity as shapely_affinity
+    from shapely.geometry import box as shapely_box
 
     from roof_calc.flood_fill import flood_fill_interior, get_house_shape_mask
     from roof_calc.geometry import extract_polygon
 
-    # 1) Build polygons for each floor
+    # 1) Build polygons for each floor – nu omitem niciun etaj (păstrăm ordinea și numărul)
     floors: List[Tuple[str, Any]] = []
     for p in all_floor_paths or []:
         img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            continue
-        filled = flood_fill_interior(img)
-        house_mask = get_house_shape_mask(filled)
-        poly = extract_polygon(house_mask)
+        poly = None
+        if img is not None:
+            filled = flood_fill_interior(img)
+            house_mask = get_house_shape_mask(filled)
+            poly = extract_polygon(house_mask)
         if poly is None or poly.is_empty:
-            continue
+            poly = shapely_box(0.0, 0.0, 1.0, 1.0)
         floors.append((p, poly))
 
     if not floors:
         return []
 
-    # 2) Sort bottom->top by footprint area (largest first)
-    floors.sort(key=lambda t: float(getattr(t[1], "area", 0.0) or 0.0), reverse=True)
+    # 2) Păstrăm ordinea engine (floor_0 = beci la baza 3D) dacă path-urile sunt floor_NN
+    import re
+    def _floor_idx(p: str) -> int:
+        stem = Path(p).stem.lower()
+        m = re.match(r"floor_?(\d+)", stem)
+        return int(m.group(1)) if m else -1
+    indices = [_floor_idx(p) for p, _ in floors]
+    if all(i >= 0 for i in indices) and len(set(indices)) == len(indices):
+        floors.sort(key=lambda t: _floor_idx(t[0]))
+    else:
+        # Sort bottom->top by footprint area (largest first) doar când nu avem nume floor_NN
+        floors.sort(key=lambda t: float(getattr(t[1], "area", 0.0) or 0.0), reverse=True)
 
     # Map path -> roof_result (because we will sort floors)
     res_by_path: Dict[str, Dict[str, Any]] = {}
