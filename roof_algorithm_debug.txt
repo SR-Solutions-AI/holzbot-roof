@@ -1,0 +1,1 @@
+loop comp area=1223978 poly_empty=False

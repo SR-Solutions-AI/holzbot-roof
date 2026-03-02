@@ -21,6 +21,32 @@ if not _pyc.exists():
 
 SourcelessFileLoader(__name__, str(_pyc)).exec_module(sys.modules[__name__])
 
+from typing import Any, Dict, Optional
+
+# ---------------------------------------------------------------------------
+# Hotfix: ensure section area_px for rectangle debug images ("Area: 0.0 px??")
+# ---------------------------------------------------------------------------
+_original_visualize_individual_rectangles = visualize_individual_rectangles  # type: ignore[name-defined]
+
+
+def _section_area_from_bounding_rect(sec: Dict[str, Any]) -> float:
+    br = sec.get("bounding_rect") or []
+    if len(br) < 3:
+        return 0.0
+    xs = [float(p[0]) for p in br]
+    ys = [float(p[1]) for p in br]
+    return (max(xs) - min(xs)) * (max(ys) - min(ys))
+
+
+def visualize_individual_rectangles(path: str, roof_result: Dict[str, Any], *, output_dir: Optional[str] = None):  # type: ignore[no-redef]
+    """Override: inject area_px from bounding_rect so debug image shows correct area."""
+    sections = roof_result.get("sections") or []
+    for s in sections:
+        if "area_px" not in s or (isinstance(s.get("area_px"), (int, float)) and s.get("area_px") == 0):
+            s["area_px"] = _section_area_from_bounding_rect(s)
+    return _original_visualize_individual_rectangles(path, roof_result, output_dir=output_dir)
+
+
 # ---------------------------------------------------------------------------
 # Hotfix: multi-floor alignment
 #

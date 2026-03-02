@@ -82,29 +82,39 @@ def calculate_roof_from_walls(
     if not components:
         return _empty_result("no building components")
 
+    # Process all components; tag sections with component_index for per-component overlap removal
+    comps_with_poly: List[tuple] = []
+    for comp_mask, label, bbox in components:
+        poly = extract_polygon(comp_mask)
+        if poly is None or poly.is_empty:
+            continue
+        st = classify_shape(poly)
+        comps_with_poly.append((comp_mask, label, bbox, poly, st))
+    if not comps_with_poly:
+        return _empty_result("no building components")
+
     all_sections: List[Dict[str, Any]] = []
     shape_type_used = "complex"
     section_id = 0
     total_footprint = 0.0
 
-    for comp_mask, _label, _bbox in components:
-        poly = extract_polygon(comp_mask)
-        if poly is None or poly.is_empty:
-            continue
+    for comp_idx, (comp_mask, _label, _bbox, poly, shape_type_used) in enumerate(comps_with_poly):
         total_footprint += float(poly.area)
-
-        shape_type_used = classify_shape(poly)
         _algo = select_algorithm(shape_type_used) if algorithm == "auto" else (
             "simple_bbox" if algorithm == "simple" else
             "rectangle_decomposition" if algorithm == "decomposition" else "medial_axis"
         )
 
-        # Use stronger decomposition using the filled component mask when available
-        rects = partition_into_rectangles(poly, filled_mask=comp_mask)
-        if not rects:
-            # fallback to oriented bbox
+        # Rectangular component: keep as single rectangle (do not decompose)
+        if shape_type_used == "rectangle":
             rect, _w, _h, angle = _oriented_bounding_rect(poly)
             rects = [(rect, angle)] if rect is not None and not rect.is_empty else []
+        else:
+            # Use stronger decomposition for L/T/U etc.
+            rects = partition_into_rectangles(poly, filled_mask=comp_mask)
+            if not rects:
+                rect, _w, _h, angle = _oriented_bounding_rect(poly)
+                rects = [(rect, angle)] if rect is not None and not rect.is_empty else []
 
         rectangles_only = [r for r, _a in rects if r is not None and not r.is_empty]
         ridge_h = calculate_ridge_lines_with_hierarchy(
@@ -133,6 +143,7 @@ def calculate_roof_from_walls(
                         sec["ridge_orientation"] = str(ridge["orientation"])
                     if "start" in ridge and "end" in ridge:
                         sec["ridge_line"] = [list(ridge["start"]), list(ridge["end"])]
+                sec["component_index"] = comp_idx
                 all_sections.append(sec)
                 section_id += 1
 

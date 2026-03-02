@@ -303,19 +303,50 @@ def _angle_2d(ox: float, oy: float, px: float, py: float) -> float:
 
 
 def _xy_to_z_map(segments: List[Tuple[List[float], List[float]]], tol: float = 5.0) -> Dict[Tuple[float, float], float]:
-    """Mapare (x,y) -> z din endpoint-urile segmentelor."""
+    """Mapare (x,y) -> z din endpoint-urile segmentelor. La același (x,y) păstrăm max(z) ca ridge să bată eava."""
     m: Dict[Tuple[float, float], float] = {}
     for p1, p2 in segments:
         for p in (p1, p2):
             k = _vertex_key(p, tol)
             k2 = (round(k[0], 2), round(k[1], 2))
-            if k2 not in m:
-                m[k2] = float(p[2])
+            z = float(p[2])
+            m[k2] = max(m.get(k2, -1e9), z)
     return m
 
 
-def _lookup_z(px: float, py: float, xy_to_z: Dict[Tuple[float, float], float], tol: float = 5.0) -> float:
-    """Caută z pentru (px, py) în mapare sau la cei mai apropiați vecini."""
+def _z_from_nearest_segment(
+    px: float, py: float,
+    segments: List[Tuple[List[float], List[float]]],
+) -> float:
+    """Z prin proiecție pe cel mai apropiat segment: vârful e pe segment, z interpolat pe el."""
+    best_z = 0.0
+    best_d2 = float("inf")
+    for p1, p2 in segments:
+        x1, y1, z1 = float(p1[0]), float(p1[1]), float(p1[2])
+        x2, y2, z2 = float(p2[0]), float(p2[1]), float(p2[2])
+        dx, dy = x2 - x1, y2 - y1
+        L2 = dx * dx + dy * dy
+        if L2 < 1e-20:
+            t = 0.0
+        else:
+            t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / L2))
+        nx, ny = x1 + t * dx, y1 + t * dy
+        z = z1 + t * (z2 - z1)
+        d2 = (px - nx) ** 2 + (py - ny) ** 2
+        if d2 < best_d2:
+            best_d2 = d2
+            best_z = z
+    return best_z
+
+
+def _lookup_z(
+    px: float, py: float,
+    xy_to_z: Dict[Tuple[float, float], float],
+    tol: float = 5.0,
+    segments_fallback: Optional[List[Tuple[List[float], List[float]]]] = None,
+) -> float:
+    """Z pentru (px, py): din mapă (exact sau cel mai apropiat în rază 10px).
+    Dacă nu e în rază, z = proiecție pe cel mai apropiat segment (ca 2_w/4_w să se ridice corect)."""
     k2 = (round(px, 2), round(py, 2))
     if k2 in xy_to_z:
         return xy_to_z[k2]
@@ -324,7 +355,11 @@ def _lookup_z(px: float, py: float, xy_to_z: Dict[Tuple[float, float], float], t
         d2 = (px - qx) ** 2 + (py - qy) ** 2
         if d2 < best_d2:
             best_d2, best_z = d2, z
-    return best_z if best_d2 < (tol * 2) ** 2 else 0.0
+    if best_d2 < (tol * 2) ** 2:
+        return best_z
+    if segments_fallback:
+        return _z_from_nearest_segment(px, py, segments_fallback)
+    return 0.0
 
 
 def _round_segment_coords(
@@ -372,9 +407,11 @@ def segments_to_faces(
     max_area = bbox_area * max_area_ratio if bbox_area > 1e-6 else 1e9
     max_area = min(max_area, bbox_area * 0.95)
     xy_to_z = _xy_to_z_map(segs_rounded, tol)
+    segments_fallback: List[Tuple[List[float], List[float]]] = list(segs_rounded)
     if segments_for_z:
         segs_z = _round_segment_coords(segments_for_z, decimals=2) or list(segments_for_z)
         xy_to_z.update(_xy_to_z_map(segs_z, tol))
+        segments_fallback = segs_rounded + segs_z
 
     try:
         from shapely.geometry import LineString
@@ -407,7 +444,7 @@ def segments_to_faces(
             vs = []
             for i in range(len(coords) - 1):
                 x, y = float(coords[i][0]), float(coords[i][1])
-                z = _lookup_z(x, y, xy_to_z, tol)
+                z = _lookup_z(x, y, xy_to_z, tol, segments_fallback=segments_fallback)
                 vs.append([x, y, z])
             if len(vs) < 3:
                 continue
