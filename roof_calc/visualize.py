@@ -2,6 +2,8 @@
 Loader shim.
 
 Restores original implementation from `roof_calc/_orig_pyc/visualize.<cache_tag>.pyc`.
+Tries each .pyc in _orig_pyc until one loads (avoids "bad magic number" when server Python differs from build Python).
+If no .pyc loads (e.g. only Python 3.14 bytecode on a 3.11 server), uses minimal stubs so import succeeds and pipeline can run.
 """
 
 from __future__ import annotations
@@ -9,19 +11,38 @@ from __future__ import annotations
 import sys
 from importlib.machinery import SourcelessFileLoader
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 _base = Path(__file__).with_name("_orig_pyc")
 _stem = Path(__file__).stem
-_pyc = _base / f"{_stem}.{sys.implementation.cache_tag}.pyc"
-if not _pyc.exists():
-    matches = sorted(_base.glob(f"{_stem}.*.pyc"))
-    if not matches:
-        raise FileNotFoundError(f"Missing cached bytecode for {_stem} in {_base}")
-    _pyc = matches[0]
+_candidates: list[Path] = []
+_exact = _base / f"{_stem}.{sys.implementation.cache_tag}.pyc"
+if _exact.exists():
+    _candidates.append(_exact)
+_candidates.extend(sorted(_base.glob(f"{_stem}.*.pyc")))
+if not _candidates:
+    raise FileNotFoundError(f"Missing cached bytecode for {_stem} in {_base}")
 
-SourcelessFileLoader(__name__, str(_pyc)).exec_module(sys.modules[__name__])
+_last_err: Exception | None = None
+for _pyc in _candidates:
+    try:
+        _loader = SourcelessFileLoader(__name__, str(_pyc))
+        _loader.exec_module(sys.modules[__name__])
+        _last_err = None
+        break
+    except ImportError as e:
+        _last_err = e
+        continue
 
-from typing import Any, Dict, Optional
+if _last_err is not None:
+    # No .pyc matched this Python version (e.g. only cpython-314 .pyc on Python 3.11).
+    # Define minimal stubs so "from roof_calc.visualize import ..." works and pipeline does not crash.
+    def visualize_individual_rectangles(path: str, roof_result: Dict[str, Any], *, output_dir: Optional[str] = None) -> None:
+        pass
+    def visualize_a_frame_lines(*args: Any, **kwargs: Any) -> bool:
+        return False
+    def _get_largest_rect_bbox(roof_result: Dict[str, Any]) -> Any:
+        return None
 
 # ---------------------------------------------------------------------------
 # Hotfix: ensure section area_px for rectangle debug images ("Area: 0.0 px??")
