@@ -414,8 +414,9 @@ def high_side_for_shed_from_upper_floor(
     tol: float = 5.0,
 ) -> List[str]:
     """
-    Pentru acoperiș într-o apă (shed): latura mai înaltă = cea care ATINGE CEL MAI MULT
-    etajul superior (chiar dacă nu atinge complet). Returnează "top" | "bottom" | "left" | "right".
+    Pentru acoperiș într-o apă (shed): latura mai înaltă = cea COMPLET lipită de etajul superior;
+    dacă niciuna nu e complet lipită, cea cu cea mai mare suprafață lipită.
+    Returnează "top" | "bottom" | "left" | "right".
     """
     try:
         from shapely.geometry import Point
@@ -465,7 +466,13 @@ def high_side_for_shed_from_upper_floor(
             return hits / total if total > 0 else 0.0
 
         ratios = {name: touch_ratio(a, b, n) for name, (a, b, n) in sides_info.items()}
-        best = max(ratios, key=ratios.get)  # type: ignore[arg-type]
+        # Prefer latură complet lipită (ratio >= 0.95); altfel cea cu cea mai mare suprafață lipită
+        FULL_ATTACH_THRESHOLD = 0.95
+        fully_attached = [name for name, r in ratios.items() if r >= FULL_ATTACH_THRESHOLD]
+        if fully_attached:
+            best = max(fully_attached, key=ratios.get)  # type: ignore[arg-type]
+        else:
+            best = max(ratios, key=ratios.get)  # type: ignore[arg-type]
         if ratios[best] > 0:
             out.append(best)
         else:

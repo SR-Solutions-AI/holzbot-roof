@@ -4372,9 +4372,9 @@ def _generate_frame_html(subdir: Path, wall_height: float = 300.0) -> None:
         return False
 
     def z_fn_contour(x: float, y: float) -> float:
-        # Pentru 0_w (plat) nu ridicăm niciun segment verde – toate la nivelul cel mai de jos
+        # 0_w: contur la nivelul pereților (wh). 1_w: latura lipită de etajul superior la ridge_z, restul la wh.
         if roof_type_frame == "1_w" and has_upper_floor and _point_on_contour_near_yellow(x, y):
-            return wh + 0.5 * wh
+            return ridge_z
         return wh
     # Portocalii: la mijlocul diagonalelor (paralele între diagonale)
     z_fn_orange = lambda x, y: (ridge_z + wh) / 2.0
@@ -4920,9 +4920,9 @@ def generate_entire_frame_html(
             return False
 
         def _z_fn_contour(x, y):
-            # Pentru 0_w (plat) nu ridicăm niciun segment verde – toate la nivelul cel mai de jos
+            # 0_w: contur la nivelul pereților. 1_w: latura lipită de etajul superior la ridge_z.
             if rt_floor == "1_w" and has_upper and _point_on_contour_near_yellow_entire(x, y):
-                return fwh + 0.5 * fwh + z_off
+                return ridge_z_local + z_off
             return fwh + z_off
 
         def _z_fn_orange(x, y):
@@ -5431,7 +5431,7 @@ def generate_entire_frame_html(
             if rt_floor == "0_w":
                 return fwh + z_off
             if rt_floor == "1_w" and has_upper_filled and _point_on_contour_near_yellow_filled(x, y):
-                return fwh + 0.5 * fwh + z_off
+                return ridge_z_local + z_off
             if rt_floor == "4.5_w" and orange_segs:
                 for oseg in orange_segs:
                     if len(oseg) >= 2:
@@ -5531,7 +5531,7 @@ def generate_entire_frame_html(
                             d2 = _min_d2(mid, upper_rect_pts_filled)
                             if d2 < best_edge_d2:
                                 best_edge_d2, best_edge_idx = d2, ei
-                    raised_z = fwh + 0.5 * fwh + z_off
+                    raised_z = ridge_z_local + z_off
                     zs = []
                     for vi in range(n):
                         on_raised_edge = vi == best_edge_idx or vi == (best_edge_idx + 1) % n
@@ -5710,6 +5710,8 @@ def populate_mixed_unfold_and_metrics(
     for floor_dir in floor_dirs:
         fidx = int(floor_dir.name.split("_")[1]) if len(floor_dir.name.split("_")) > 1 and floor_dir.name.split("_")[1].isdigit() else 0
         rt = floor_roof_types.get(fidx, "2_w")
+        if not rt:
+            continue
         base_src = floor_dir / rt
         _process_unfold_src(base_src / "unfold_roof", unfold_roof_dir, fidx, faces_metrics_roof, floor_totals_roof)
         _process_unfold_src(base_src / "unfold_overhang", unfold_overhang_dir, fidx, faces_metrics_overhang, floor_totals_overhang)

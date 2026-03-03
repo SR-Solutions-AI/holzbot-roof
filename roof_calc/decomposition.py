@@ -539,11 +539,10 @@ def partition_into_rectangles(
             if float(r0.area) >= 0.98 * total_pixels:
                 return result_greedy
 
-    if len(result_rec) > len(result_greedy):
-        print("  ✓ Descompunere recursivă:", len(result_rec), "dreptunghiuri.", flush=True)
-        return result_rec
+    # Mereu preferăm greedy: la fiecare pas se alege cel mai mare dreptunghi posibil.
+    # Nu folosim result_rec (descompunere recursivă) care poate da mai multe dreptunghiuri mai mici.
     if n_concave > 0 and len(result_rec) > 0:
-        print("  ○ Recursiv", len(result_rec), "vs greedy", len(result_greedy), "– folosit greedy.", flush=True)
+        print("  ○ Recursiv", len(result_rec), "vs greedy", len(result_greedy), "– folosit greedy (cel mai mare dreptunghi la fiecare pas).", flush=True)
     return result_greedy
 
 
