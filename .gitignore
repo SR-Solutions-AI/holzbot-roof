@@ -1,0 +1,21 @@
+# Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual envs
+.venv/
+.venv314/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Local outputs (optional)
+# output_*/
+# roof_algorithm_debug.txt

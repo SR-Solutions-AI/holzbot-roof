@@ -412,7 +412,12 @@ def partition_into_rectangles_FIXED(polygon: Polygon, filled_mask: np.ndarray) -
     
     # STEP 2: Filtrare strictă (overlap >= 90%)
     print("\n🔍 STEP 2: Filtrare strictă (overlap >= 90%)...")
-    filtered = [r for r in rects if _check_mask_overlap(r, filled_mask) >= GRID_STRICT_OVERLAP]
+    overlaps = [_check_mask_overlap(r, filled_mask) for r in rects]
+    for i, (r, ov) in enumerate(zip(rects, overlaps)):
+        pct = ov * 100
+        status = "✓ păstrat" if ov >= GRID_STRICT_OVERLAP else "✗ eliminat"
+        print(f"  Dreptunghi {i+1}: overlap={pct:.1f}% {status}")
+    filtered = [r for r, ov in zip(rects, overlaps) if ov >= GRID_STRICT_OVERLAP]
     print(f"  ✓ După filtrare: {len(filtered)} dreptunghiuri")
     
     # STEP 3: Completare zone neacoperite
@@ -422,7 +427,12 @@ def partition_into_rectangles_FIXED(polygon: Polygon, filled_mask: np.ndarray) -
     
     # STEP 4: Re-filtrare după completare
     print("\n🔍 STEP 4: Re-filtrare strictă...")
-    complete = [r for r in complete if _check_mask_overlap(r, filled_mask) >= GRID_STRICT_OVERLAP]
+    overlaps_re = [_check_mask_overlap(r, filled_mask) for r in complete]
+    for i, (r, ov) in enumerate(zip(complete, overlaps_re)):
+        pct = ov * 100
+        status = "✓ păstrat" if ov >= GRID_STRICT_OVERLAP else "✗ eliminat"
+        print(f"  Dreptunghi {i+1}: overlap={pct:.1f}% {status}")
+    complete = [r for r, ov in zip(complete, overlaps_re) if ov >= GRID_STRICT_OVERLAP]
     print(f"  ✓ După re-filtrare: {len(complete)} dreptunghiuri")
     
     # STEP 5: Combinare overlap-uri
