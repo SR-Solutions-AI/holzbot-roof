@@ -265,6 +265,14 @@ def _compute_overlay_offsets(floor_paths: List[str], roof_results: List[dict], f
         xs, ys = [float(p[0]) for p in br], [float(p[1]) for p in br]
         return ((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0)
 
+    def _mask_center(mask):
+        if mask is None:
+            return (0.0, 0.0)
+        m = cv2.moments((mask > 0).astype(np.uint8))
+        if m.get("m00", 0.0) == 0.0:
+            return (0.0, 0.0)
+        return (float(m["m10"] / m["m00"]), float(m["m01"] / m["m00"]))
+
     # Referință: etajul cu cea mai mare suprafață (polygon house shape)
     polys = [_poly(p) for p in floor_paths]
     best_i = 0
@@ -325,8 +333,14 @@ def _compute_overlay_offsets(floor_paths: List[str], roof_results: List[dict], f
                 cxi, cyi = _sec_center(other_main_sec)
                 dx0 = int(round(cx_ref - cxi))
                 dy0 = int(round(cy_ref - cyi))
+                # Prefer geometric centroid alignment when masks are available.
+                mx_ref, my_ref = _mask_center(ref_mask)
+                mx_other, my_other = _mask_center(other_mask)
+                if mx_ref or my_ref or mx_other or my_other:
+                    dx0 = int(round(mx_ref - mx_other))
+                    dy0 = int(round(my_ref - my_other))
                 step = max(1, min(ref_w, ref_h, other_w, other_h) // 80)
-                range_fine = min(40, max(10, step * 5))
+                range_fine = min(180, max(30, step * 8))
                 best_overlap = -1
                 best_dx, best_dy = dx0, dy0
                 if ref_mask is not None and other_mask is not None and ref_mask.any() and other_mask.any():
@@ -359,26 +373,21 @@ def _compute_overlay_offsets(floor_paths: List[str], roof_results: List[dict], f
                         if not (debug_output_dir / "ref_floor.png").exists():
                             cv2.imwrite(str(debug_output_dir / "ref_floor.png"), ref_mask)
                         cv2.imwrite(str(debug_output_dir / f"other_{other_basename}.png"), other_mask)
-                        h_canvas = max(ref_h, other_h + max(0, best_dy))
-                        w_canvas = max(ref_w, other_w + max(0, best_dx))
+                        x_ref = max(0, -best_dx)
+                        y_ref = max(0, -best_dy)
+                        x_other = max(0, best_dx)
+                        y_other = max(0, best_dy)
+                        h_canvas = max(y_ref + ref_h, y_other + other_h)
+                        w_canvas = max(x_ref + ref_w, x_other + other_w)
                         canvas = np.zeros((h_canvas, w_canvas, 3), dtype=np.uint8)
-                        canvas[:ref_h, :ref_w, 1] = ref_mask
-                        dy_lo = max(0, best_dy)
-                        dy_hi = min(h_canvas, best_dy + other_h)
-                        dx_lo = max(0, best_dx)
-                        dx_hi = min(w_canvas, best_dx + other_w)
-                        sy0 = dy_lo - best_dy
-                        sy1 = sy0 + (dy_hi - dy_lo)
-                        sx0 = dx_lo - best_dx
-                        sx1 = sx0 + (dx_hi - dx_lo)
-                        if sy1 > sy0 and sx1 > sx0:
-                            crop = other_mask[sy0:sy1, sx0:sx1]
-                            canvas[dy_lo:dy_hi, dx_lo:dx_hi, 2] = np.maximum(canvas[dy_lo:dy_hi, dx_lo:dx_hi, 2], crop)
-                        ref_crop_h, ref_crop_w = min(ref_h, h_canvas), min(ref_w, w_canvas)
-                        overlap_zone = (canvas[:ref_crop_h, :ref_crop_w, 1] > 0) & (canvas[:ref_crop_h, :ref_crop_w, 2] > 0)
-                        canvas[:ref_crop_h, :ref_crop_w, 0][overlap_zone] = 0
-                        canvas[:ref_crop_h, :ref_crop_w, 1][overlap_zone] = 255
-                        canvas[:ref_crop_h, :ref_crop_w, 2][overlap_zone] = 255
+                        canvas[y_ref:y_ref + ref_h, x_ref:x_ref + ref_w, 1] = ref_mask
+                        canvas[y_other:y_other + other_h, x_other:x_other + other_w, 2] = np.maximum(
+                            canvas[y_other:y_other + other_h, x_other:x_other + other_w, 2], other_mask
+                        )
+                        overlap_zone = (canvas[:, :, 1] > 0) & (canvas[:, :, 2] > 0)
+                        canvas[:, :, 0][overlap_zone] = 0
+                        canvas[:, :, 1][overlap_zone] = 255
+                        canvas[:, :, 2][overlap_zone] = 255
                         cv2.imwrite(str(debug_output_dir / f"overlay_{other_basename}.png"), canvas)
                         print(f"   ✓ [overlay_debug] Salvat (ariile ~egale, centru): {debug_output_dir}/ overlay_{other_basename}.png")
                     except Exception as e:
@@ -429,6 +438,11 @@ def _compute_overlay_offsets(floor_paths: List[str], roof_results: List[dict], f
                     cxi, cyi = _sec_center(other_main_sec)
                     dx0 = int(round(cx_ref - cxi))
                     dy0 = int(round(cy_ref - cyi))
+                    mx_ref, my_ref = _mask_center(use_ref_mask)
+                    mx_other, my_other = _mask_center(use_other_mask)
+                    if mx_ref or my_ref or mx_other or my_other:
+                        dx0 = int(round(mx_ref - mx_other))
+                        dy0 = int(round(my_ref - my_other))
                     best_overlap = -1
                     best_dx, best_dy = dx0, dy0
                     for dx in range(dx0 - range_fine, dx0 + range_fine + 1, step):
@@ -463,26 +477,22 @@ def _compute_overlay_offsets(floor_paths: List[str], roof_results: List[dict], f
                                 cv2.imwrite(str(debug_output_dir / f"trimmed_{other_basename}.png"), use_other_mask)
                             else:
                                 cv2.imwrite(str(debug_output_dir / "trimmed_ref_floor.png"), use_ref_mask)
-                            h_canvas = max(ref_h, use_oh + max(0, best_dy))
-                            w_canvas = max(ref_w, use_ow + max(0, best_dx))
+                            use_rh, use_rw = use_ref_mask.shape[:2]
+                            x_ref = max(0, -best_dx)
+                            y_ref = max(0, -best_dy)
+                            x_other = max(0, best_dx)
+                            y_other = max(0, best_dy)
+                            h_canvas = max(y_ref + use_rh, y_other + use_oh)
+                            w_canvas = max(x_ref + use_rw, x_other + use_ow)
                             canvas = np.zeros((h_canvas, w_canvas, 3), dtype=np.uint8)
-                            canvas[:ref_h, :ref_w, 1] = use_ref_mask
-                            dy_lo = max(0, best_dy)
-                            dy_hi = min(h_canvas, best_dy + use_oh)
-                            dx_lo = max(0, best_dx)
-                            dx_hi = min(w_canvas, best_dx + use_ow)
-                            sy0 = dy_lo - best_dy
-                            sy1 = sy0 + (dy_hi - dy_lo)
-                            sx0 = dx_lo - best_dx
-                            sx1 = sx0 + (dx_hi - dx_lo)
-                            if sy1 > sy0 and sx1 > sx0:
-                                crop = use_other_mask[sy0:sy1, sx0:sx1]
-                                canvas[dy_lo:dy_hi, dx_lo:dx_hi, 2] = np.maximum(canvas[dy_lo:dy_hi, dx_lo:dx_hi, 2], crop)
-                            ref_crop_h, ref_crop_w = min(ref_h, h_canvas), min(ref_w, w_canvas)
-                            overlap_zone = (canvas[:ref_crop_h, :ref_crop_w, 1] > 0) & (canvas[:ref_crop_h, :ref_crop_w, 2] > 0)
-                            canvas[:ref_crop_h, :ref_crop_w, 0][overlap_zone] = 0
-                            canvas[:ref_crop_h, :ref_crop_w, 1][overlap_zone] = 255
-                            canvas[:ref_crop_h, :ref_crop_w, 2][overlap_zone] = 255
+                            canvas[y_ref:y_ref + use_rh, x_ref:x_ref + use_rw, 1] = use_ref_mask
+                            canvas[y_other:y_other + use_oh, x_other:x_other + use_ow, 2] = np.maximum(
+                                canvas[y_other:y_other + use_oh, x_other:x_other + use_ow, 2], use_other_mask
+                            )
+                            overlap_zone = (canvas[:, :, 1] > 0) & (canvas[:, :, 2] > 0)
+                            canvas[:, :, 0][overlap_zone] = 0
+                            canvas[:, :, 1][overlap_zone] = 255
+                            canvas[:, :, 2][overlap_zone] = 255
                             cv2.imwrite(str(debug_output_dir / f"overlay_{other_basename}.png"), canvas)
                             print(f"   ✓ [overlay_debug] Salvat: {debug_output_dir}/ (trimmed_{other_basename}.png, overlay_{other_basename}.png)")
                         except Exception as e:
@@ -501,26 +511,21 @@ def _compute_overlay_offsets(floor_paths: List[str], roof_results: List[dict], f
                         cv2.imwrite(str(debug_output_dir / "ref_floor.png"), ref_mask)
                     cv2.imwrite(str(debug_output_dir / f"other_{other_basename}.png"), other_mask)
                     best_dx, best_dy = dx_edges, dy_edges
-                    h_canvas = max(ref_h, other_h + max(0, best_dy))
-                    w_canvas = max(ref_w, other_w + max(0, best_dx))
+                    x_ref = max(0, -best_dx)
+                    y_ref = max(0, -best_dy)
+                    x_other = max(0, best_dx)
+                    y_other = max(0, best_dy)
+                    h_canvas = max(y_ref + ref_h, y_other + other_h)
+                    w_canvas = max(x_ref + ref_w, x_other + other_w)
                     canvas = np.zeros((h_canvas, w_canvas, 3), dtype=np.uint8)
-                    canvas[:ref_h, :ref_w, 1] = ref_mask
-                    dy_lo = max(0, best_dy)
-                    dy_hi = min(h_canvas, best_dy + other_h)
-                    dx_lo = max(0, best_dx)
-                    dx_hi = min(w_canvas, best_dx + other_w)
-                    sy0 = dy_lo - best_dy
-                    sy1 = sy0 + (dy_hi - dy_lo)
-                    sx0 = dx_lo - best_dx
-                    sx1 = sx0 + (dx_hi - dx_lo)
-                    if sy1 > sy0 and sx1 > sx0:
-                        crop = other_mask[sy0:sy1, sx0:sx1]
-                        canvas[dy_lo:dy_hi, dx_lo:dx_hi, 2] = np.maximum(canvas[dy_lo:dy_hi, dx_lo:dx_hi, 2], crop)
-                    ref_crop_h, ref_crop_w = min(ref_h, h_canvas), min(ref_w, w_canvas)
-                    overlap_zone = (canvas[:ref_crop_h, :ref_crop_w, 1] > 0) & (canvas[:ref_crop_h, :ref_crop_w, 2] > 0)
-                    canvas[:ref_crop_h, :ref_crop_w, 0][overlap_zone] = 0
-                    canvas[:ref_crop_h, :ref_crop_w, 1][overlap_zone] = 255
-                    canvas[:ref_crop_h, :ref_crop_w, 2][overlap_zone] = 255
+                    canvas[y_ref:y_ref + ref_h, x_ref:x_ref + ref_w, 1] = ref_mask
+                    canvas[y_other:y_other + other_h, x_other:x_other + other_w, 2] = np.maximum(
+                        canvas[y_other:y_other + other_h, x_other:x_other + other_w, 2], other_mask
+                    )
+                    overlap_zone = (canvas[:, :, 1] > 0) & (canvas[:, :, 2] > 0)
+                    canvas[:, :, 0][overlap_zone] = 0
+                    canvas[:, :, 1][overlap_zone] = 255
+                    canvas[:, :, 2][overlap_zone] = 255
                     cv2.imwrite(str(debug_output_dir / f"overlay_{other_basename}.png"), canvas)
                     print(f"   ✓ [overlay_debug] Salvat (aliniere muchii): {debug_output_dir}/ overlay_{other_basename}.png")
                 except Exception as e:
@@ -536,12 +541,16 @@ def _compute_overlay_offsets(floor_paths: List[str], roof_results: List[dict], f
         )
         if use_brute_force:
             step = int(max(1, min(ref_w, ref_h, other_w, other_h) // 50))
-            range_x = int(min(200, max(50, (min(ref_w, other_w) + 1) // 2)))
-            range_y = int(min(200, max(50, (min(ref_h, other_h) + 1) // 2)))
+            mx_ref, my_ref = _mask_center(ref_mask)
+            mx_other, my_other = _mask_center(other_mask)
+            dx0 = int(round(mx_ref - mx_other))
+            dy0 = int(round(my_ref - my_other))
+            range_x = int(min(260, max(60, (min(ref_w, other_w) + 1) // 2)))
+            range_y = int(min(260, max(60, (min(ref_h, other_h) + 1) // 2)))
             best_overlap = -1
-            best_dx, best_dy = 0, 0
-            for dx in range(-range_x, range_x + 1, step):
-                for dy in range(-range_y, range_y + 1, step):
+            best_dx, best_dy = dx0, dy0
+            for dx in range(dx0 - range_x, dx0 + range_x + 1, step):
+                for dy in range(dy0 - range_y, dy0 + range_y + 1, step):
                     overlap = _overlap_area_at_offset(
                         ref_mask, ref_w, ref_h,
                         other_mask, other_w, other_h,
@@ -847,34 +856,9 @@ def run_clean_workflow(
             continue
         floors_with_rects.append((floor_idx, floor_path, remaining))
 
-    # Perechi adiacente top-down:
-    # X se compară cu X-1, apoi X-1 cu X-2, etc., păstrând în memorie dreptunghiurile deja alocate mai sus.
-    floors_to_output: List[Tuple[int, str, list]] = []
-    used_areas_from_upper: List[float] = []
-    for i in range(len(floors_with_rects) - 1, -1, -1):
-        fi, fp, rem = floors_with_rects[i]
-        lower_areas = []
-        if i - 1 >= 0:
-            lower_areas = [_rect_area(s) for s in floors_with_rects[i - 1][2]]
-        filtered: List[dict] = []
-        for s in rem:
-            a = _rect_area(s)
-            if a <= 0:
-                continue
-            already_used = any(_areas_match(a, ua) for ua in used_areas_from_upper)
-            if already_used:
-                continue
-            if lower_areas:
-                # Etaje intermediare/superioare: păstrăm doar dreptunghiurile care au corespondent pe vecinul imediat inferior.
-                if any(_areas_match(a, la) for la in lower_areas):
-                    filtered.append(s)
-            else:
-                # Etajul de bază: păstrăm ce nu a fost deja alocat de etajele superioare.
-                filtered.append(s)
-        if filtered:
-            floors_to_output.append((fi, fp, filtered))
-            used_areas_from_upper.extend([_rect_area(s) for s in filtered])
-    floors_to_output.sort(key=lambda t: t[0])
+    # Keep rectangles per-floor as detected (except basement filter above).
+    # Cross-floor area matching/dedup can incorrectly drop valid sections on non-flat levels.
+    floors_to_output: List[Tuple[int, str, list]] = sorted(floors_with_rects, key=lambda t: t[0])
 
     # Pentru foldere rectangles/ și roof_types/: procesăm TOATE etajele (inclusiv 0_w fără secțiuni)
     # Asociem remaining STRICT după path (nu după poziție), apoi iterăm all_floor_paths ca output_idx să fie mereu 0,1,2...
@@ -889,12 +873,6 @@ def run_clean_workflow(
                 for output_idx, floor_path in enumerate(all_floor_paths):
                     path_to_remaining[_norm_path(floor_path)] = edited_sections.get(output_idx, [])
                 print(f"   ✓ Folosesc secțiuni editate din: {edited_p}")
-    # Ordine de scriere: all_floor_paths (primul plan = floor_0, al doilea = floor_1)
-    all_floors_with_remaining: List[Tuple[int, str, list]] = []
-    for output_idx, floor_path in enumerate(all_floor_paths):
-        remaining = path_to_remaining.get(_norm_path(floor_path), [])
-        all_floors_with_remaining.append((output_idx, floor_path, remaining))
-
     # Ordinea pentru overlay/offsets trebuie să fie all_floor_paths ca "0"/"1" să corespundă floor_0/floor_1
     ordered_paths = list(all_floor_paths)
     roof_results_ordered = []
@@ -914,6 +892,108 @@ def run_clean_workflow(
         debug_output_dir=output_path / "overlay_debug",
     ) if len(ordered_paths) >= 2 else {}
 
+    # Pairwise top-down:
+    # pentru fiecare pereche vecină de etaje, aliniem BRUTE FORCE doar cel mai mare
+    # dreptunghi de sus cu cel mai mare dreptunghi de jos (fără rotații),
+    # apoi eliminăm dreptunghiul de la etajul inferior.
+    # Cumulativ: ce se șterge la un pas rămâne șters în pașii următori.
+    def _sec_bbox(sec):
+        br = sec.get("bounding_rect") or []
+        if len(br) < 3:
+            return None
+        xs = [float(p[0]) for p in br]
+        ys = [float(p[1]) for p in br]
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    def _section_mask(sec, w: int, h: int):
+        mask = np.zeros((h, w), dtype=np.uint8)
+        bb = _sec_bbox(sec)
+        if bb is None:
+            return mask
+        x1, y1, x2, y2 = bb
+        xi1 = max(0, min(w - 1, int(round(x1))))
+        yi1 = max(0, min(h - 1, int(round(y1))))
+        xi2 = max(0, min(w - 1, int(round(x2))))
+        yi2 = max(0, min(h - 1, int(round(y2))))
+        if xi2 <= xi1 or yi2 <= yi1:
+            return mask
+        cv2.rectangle(mask, (xi1, yi1), (xi2, yi2), 255, thickness=-1)
+        return mask
+
+    def _largest_section_idx(sections):
+        best_idx = None
+        best_area = -1.0
+        for i, s in enumerate(sections or []):
+            bb = _sec_bbox(s)
+            if bb is None:
+                continue
+            area = max(0.0, bb[2] - bb[0]) * max(0.0, bb[3] - bb[1])
+            if area > best_area:
+                best_area = area
+                best_idx = i
+        return best_idx
+
+    # Cache dimensiuni per etaj
+    dims_by_path: dict[str, tuple[int, int]] = {}
+    for fp in all_floor_paths:
+        img = cv2.imread(fp, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            dims_by_path[fp] = (0, 0)
+        else:
+            dims_by_path[fp] = (int(img.shape[1]), int(img.shape[0]))
+
+    for upper_idx in range(0, len(all_floor_paths) - 1):
+        lower_idx = upper_idx + 1
+        up_path = all_floor_paths[upper_idx]
+        lo_path = all_floor_paths[lower_idx]
+        up_key = _norm_path(up_path)
+        lo_key = _norm_path(lo_path)
+        up_sections = path_to_remaining.get(up_key, [])
+        lo_sections = path_to_remaining.get(lo_key, [])
+        if not up_sections or not lo_sections:
+            continue
+
+        up_w, up_h = dims_by_path.get(up_path, (0, 0))
+        lo_w, lo_h = dims_by_path.get(lo_path, (0, 0))
+        if up_w <= 0 or up_h <= 0 or lo_w <= 0 or lo_h <= 0:
+            continue
+
+        up_largest_idx = _largest_section_idx(up_sections)
+        lo_largest_idx = _largest_section_idx(lo_sections)
+        if up_largest_idx is None or lo_largest_idx is None:
+            continue
+        up_mask = _section_mask(up_sections[up_largest_idx], up_w, up_h)
+        lo_mask = _section_mask(lo_sections[lo_largest_idx], lo_w, lo_h)
+        if not up_mask.any() or not lo_mask.any():
+            continue
+
+        # Seed din offsets globale existente; apoi brute-force local pentru pereche.
+        up_off = offsets_by_path.get(up_path, (0.0, 0.0))
+        lo_off = offsets_by_path.get(lo_path, (0.0, 0.0))
+        dx0 = int(round(up_off[0] - lo_off[0]))
+        dy0 = int(round(up_off[1] - lo_off[1]))
+        step = max(1, min(up_w, up_h, lo_w, lo_h) // 90)
+        search = max(20, min(220, int(max(up_w, up_h, lo_w, lo_h) * 0.12)))
+        best_overlap = -1
+        best_dx, best_dy = dx0, dy0
+        for dx in range(dx0 - search, dx0 + search + 1, step):
+            for dy in range(dy0 - search, dy0 + search + 1, step):
+                ov = _overlap_area_at_offset(up_mask, up_w, up_h, lo_mask, lo_w, lo_h, dx, dy)
+                if ov > best_overlap:
+                    best_overlap = ov
+                    best_dx, best_dy = dx, dy
+        if step > 1:
+            for dx in range(best_dx - step, best_dx + step + 1):
+                for dy in range(best_dy - step, best_dy + step + 1):
+                    ov = _overlap_area_at_offset(up_mask, up_w, up_h, lo_mask, lo_w, lo_h, dx, dy)
+                    if ov > best_overlap:
+                        best_overlap = ov
+                        best_dx, best_dy = dx, dy
+
+        # După aliniere (fără rotații), eliminăm dreptunghiul inferior folosit la comparație.
+        lower_filtered = [s for i, s in enumerate(lo_sections) if i != lo_largest_idx]
+        path_to_remaining[lo_key] = lower_filtered
+
     rectangles_dir = output_path / "rectangles"
     roof_types_dir = output_path / "roof_types"
     roof_types_dir.mkdir(parents=True, exist_ok=True)
@@ -925,6 +1005,11 @@ def run_clean_workflow(
     (roof_types_dir / "overlay_offsets.json").write_text(
         json.dumps(overlay_offsets, indent=0), encoding="utf-8"
     )
+    # Ordine de scriere: all_floor_paths (primul plan = floor_0, al doilea = floor_1)
+    all_floors_with_remaining: List[Tuple[int, str, list]] = []
+    for output_idx, floor_path in enumerate(all_floor_paths):
+        remaining = path_to_remaining.get(_norm_path(floor_path), [])
+        all_floors_with_remaining.append((output_idx, floor_path, remaining))
     floors_info = [{"floor_idx": output_idx, "path": str(Path(p).resolve())} for output_idx, p, _ in all_floors_with_remaining]
     (roof_types_dir / "floors_info.json").write_text(
         json.dumps(floors_info, indent=0), encoding="utf-8"
