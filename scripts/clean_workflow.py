@@ -10,7 +10,7 @@ import os
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import List, Optional, Tuple, Any
+from typing import List, Optional, Tuple, Any, Dict
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -613,7 +613,106 @@ def detect_floors_from_folder(folder_path: str) -> Tuple[List[str], Optional[str
     return [x[0] for x in sizes], sizes[0][0]
 
 
-def run_clean_workflow(wall_mask_path: str, output_dir: str = "output", rectangles_only: bool = False) -> None:
+def _sections_from_edited_json(
+    edited_json_path: Path,
+    num_floors: int,
+) -> Dict[int, list]:
+    """
+    Convert roof_rectangles_edited.json (editor polygons) into roof sections for roof_types_workflow.
+    Returns mapping: floor_idx -> list[section].
+    """
+    out: Dict[int, list] = {}
+    try:
+        raw = json.loads(edited_json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return out
+    if not isinstance(raw, dict):
+        return out
+
+    for k, rects in raw.items():
+        try:
+            floor_idx = int(k)
+        except Exception:
+            continue
+        if floor_idx < 0 or floor_idx >= num_floors:
+            continue
+        if not isinstance(rects, list):
+            continue
+        sections = []
+        for r in rects:
+            pts = r.get("points") if isinstance(r, dict) else None
+            if not isinstance(pts, list) or len(pts) < 3:
+                continue
+            arr = []
+            for p in pts:
+                if isinstance(p, list) and len(p) >= 2:
+                    arr.append([float(p[0]), float(p[1])])
+            if len(arr) < 3:
+                continue
+            np_pts = np.array(arr, dtype=np.float32)
+            rect = cv2.minAreaRect(np_pts)
+            box = cv2.boxPoints(rect).tolist()
+            (cx, cy), (rw, rh), _ang = rect
+            if rw >= rh:
+                ridge = [(float(cx - rw * 0.5), float(cy)), (float(cx + rw * 0.5), float(cy))]
+                orientation = "horizontal"
+            else:
+                ridge = [(float(cx), float(cy - rh * 0.5)), (float(cx), float(cy + rh * 0.5))]
+                orientation = "vertical"
+            sections.append(
+                {
+                    "bounding_rect": [(float(p[0]), float(p[1])) for p in box],
+                    "ridge_line": ridge,
+                    "ridge_orientation": orientation,
+                    "is_main": False,
+                    "roofAngleDeg": r.get("roofAngleDeg") if isinstance(r, dict) else None,
+                    "roofType": r.get("roofType") if isinstance(r, dict) else None,
+                    "roomName": r.get("roomName") if isinstance(r, dict) else None,
+                }
+            )
+        out[floor_idx] = sections
+    return out
+
+
+def _generate_per_rectangle_3d_unfold(
+    output_path: Path,
+    floor_idx: int,
+    floor_path: str,
+    sections: list,
+    roof_angle_deg: float,
+) -> None:
+    """
+    Generate per-rectangle 3D unfold outputs:
+      roof_3d/rectangles_3d/floor_X/rectangle_SY/unfold_roof/*.png
+      roof_3d/rectangles_3d/floor_X/rectangle_SY/unfold_overhang/*.png
+    """
+    rect3d_root = output_path / "rectangles_3d" / f"floor_{floor_idx}"
+    rect3d_root.mkdir(parents=True, exist_ok=True)
+    for rect_idx, sec in enumerate(sections or []):
+        if not isinstance(sec, dict):
+            continue
+        sec_list = [sec]
+        rect_dir = rect3d_root / f"rectangle_S{rect_idx}"
+        rect_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            generate_roof_type_outputs(
+                floor_path,
+                {"sections": sec_list},
+                sec_list,
+                rect_dir,
+                roof_angle_deg=float(sec.get("roofAngleDeg") or roof_angle_deg),
+                wall_height=300.0,
+                upper_floor_sections=None,
+            )
+        except Exception as e:
+            print(f"   ⚠ rectangles_3d/floor_{floor_idx}/rectangle_S{rect_idx}: {e}")
+
+def run_clean_workflow(
+    wall_mask_path: str,
+    output_dir: str = "output",
+    rectangles_only: bool = False,
+    edited_json_path: Optional[str] = None,
+) -> None:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -708,8 +807,22 @@ def run_clean_workflow(wall_mask_path: str, output_dir: str = "output", rectangl
             return False
         return 0.9 * b <= a <= 1.1 * b or 0.9 * a <= b <= 1.1 * a
 
+    basement_floor_index: Optional[int] = None
+    bfi_path = output_path / "basement_floor_index.json"
+    if bfi_path.exists():
+        try:
+            bfi_data = json.loads(bfi_path.read_text(encoding="utf-8"))
+            raw_bfi = bfi_data.get("basement_floor_index")
+            if raw_bfi is not None:
+                basement_floor_index = int(raw_bfi)
+        except Exception:
+            basement_floor_index = None
+
     floors_with_rects: List[Tuple[int, str, list]] = []
     for floor_idx, (floor_path, _) in enumerate(floors_ordered):
+        # Beciul nu are acoperiș: nu extragem dreptunghiuri de acoperiș pentru acest etaj.
+        if basement_floor_index is not None and floor_idx == basement_floor_index:
+            continue
         res = path_to_result.get(floor_path)
         if res is None:
             continue
@@ -734,24 +847,48 @@ def run_clean_workflow(wall_mask_path: str, output_dir: str = "output", rectangl
             continue
         floors_with_rects.append((floor_idx, floor_path, remaining))
 
-    # Pentru fiecare etaj: păstrăm doar dreptunghiurile care NU au match (arie ±10%) la un etaj superior
+    # Perechi adiacente top-down:
+    # X se compară cu X-1, apoi X-1 cu X-2, etc., păstrând în memorie dreptunghiurile deja alocate mai sus.
     floors_to_output: List[Tuple[int, str, list]] = []
-    for i, (fi, fp, rem) in enumerate(floors_with_rects):
-        upper_areas = []
-        for j in range(i + 1, len(floors_with_rects)):
-            upper_areas.extend([_rect_area(s) for s in floors_with_rects[j][2]])
-        filtered = [
-            s for s in rem
-            if not any(_areas_match(_rect_area(s), ua) for ua in upper_areas)
-        ]
+    used_areas_from_upper: List[float] = []
+    for i in range(len(floors_with_rects) - 1, -1, -1):
+        fi, fp, rem = floors_with_rects[i]
+        lower_areas = []
+        if i - 1 >= 0:
+            lower_areas = [_rect_area(s) for s in floors_with_rects[i - 1][2]]
+        filtered: List[dict] = []
+        for s in rem:
+            a = _rect_area(s)
+            if a <= 0:
+                continue
+            already_used = any(_areas_match(a, ua) for ua in used_areas_from_upper)
+            if already_used:
+                continue
+            if lower_areas:
+                # Etaje intermediare/superioare: păstrăm doar dreptunghiurile care au corespondent pe vecinul imediat inferior.
+                if any(_areas_match(a, la) for la in lower_areas):
+                    filtered.append(s)
+            else:
+                # Etajul de bază: păstrăm ce nu a fost deja alocat de etajele superioare.
+                filtered.append(s)
         if filtered:
             floors_to_output.append((fi, fp, filtered))
+            used_areas_from_upper.extend([_rect_area(s) for s in filtered])
+    floors_to_output.sort(key=lambda t: t[0])
 
     # Pentru foldere rectangles/ și roof_types/: procesăm TOATE etajele (inclusiv 0_w fără secțiuni)
     # Asociem remaining STRICT după path (nu după poziție), apoi iterăm all_floor_paths ca output_idx să fie mereu 0,1,2...
     def _norm_path(p: str) -> str:
         return str(Path(p).resolve())
     path_to_remaining: dict = {_norm_path(fp): rem for _fi, fp, rem in floors_to_output}
+    if edited_json_path:
+        edited_p = Path(edited_json_path)
+        if edited_p.exists():
+            edited_sections = _sections_from_edited_json(edited_p, len(all_floor_paths))
+            if edited_sections:
+                for output_idx, floor_path in enumerate(all_floor_paths):
+                    path_to_remaining[_norm_path(floor_path)] = edited_sections.get(output_idx, [])
+                print(f"   ✓ Folosesc secțiuni editate din: {edited_p}")
     # Ordine de scriere: all_floor_paths (primul plan = floor_0, al doilea = floor_1)
     all_floors_with_remaining: List[Tuple[int, str, list]] = []
     for output_idx, floor_path in enumerate(all_floor_paths):
@@ -760,7 +897,10 @@ def run_clean_workflow(wall_mask_path: str, output_dir: str = "output", rectangl
 
     # Ordinea pentru overlay/offsets trebuie să fie all_floor_paths ca "0"/"1" să corespundă floor_0/floor_1
     ordered_paths = list(all_floor_paths)
-    roof_results_ordered = [path_to_result.get(p, {"sections": []}) for p in ordered_paths]
+    roof_results_ordered = []
+    for p in ordered_paths:
+        base_res = path_to_result.get(p, {"sections": []})
+        roof_results_ordered.append({**base_res, "sections": path_to_remaining.get(_norm_path(p), [])})
     floors_meta = None
     if input_path.is_dir():
         meta_path = input_path / "floors_meta.json"
@@ -789,15 +929,6 @@ def run_clean_workflow(wall_mask_path: str, output_dir: str = "output", rectangl
     (roof_types_dir / "floors_info.json").write_text(
         json.dumps(floors_info, indent=0), encoding="utf-8"
     )
-
-    basement_floor_index: Optional[int] = None
-    bfi_path = output_path / "basement_floor_index.json"
-    if bfi_path.exists():
-        try:
-            bfi_data = json.loads(bfi_path.read_text(encoding="utf-8"))
-            basement_floor_index = bfi_data.get("basement_floor_index")
-        except Exception:
-            pass
 
     for output_idx, floor_path, remaining in all_floors_with_remaining:
         res = path_to_result.get(floor_path)
@@ -851,6 +982,14 @@ def run_clean_workflow(wall_mask_path: str, output_dir: str = "output", rectangl
                     upper_floor_sections=upper_sections if upper_sections else None,
                 )
                 print(f"   ✓ roof_types/floor_{output_idx}/: 0_w, 1_w, 2_w, 4_w, 4.5_w (lines.png, faces.png, frame.html, unfold_roof/, unfold_overhang/)")
+                # Per rectangle 3D renders (single-section run) used for rectangle-level quantities.
+                _generate_per_rectangle_3d_unfold(
+                    output_path=output_path,
+                    floor_idx=output_idx,
+                    floor_path=floor_path,
+                    sections=remaining,
+                    roof_angle_deg=roof_angle_floor,
+                )
             except Exception as e:
                 print(f"   ⚠ roof_types/floor_{output_idx}: {e}")
 
@@ -907,11 +1046,18 @@ def run_clean_workflow(wall_mask_path: str, output_dir: str = "output", rectangl
 
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if a != "--rectangles-only"]
+    edited_json_path = None
+    cli_args = []
+    for a in sys.argv[1:]:
+        if a.startswith("--edited-json="):
+            edited_json_path = a.split("=", 1)[1].strip() or None
+            continue
+        cli_args.append(a)
+    args = [a for a in cli_args if a != "--rectangles-only"]
     rectangles_only = "--rectangles-only" in sys.argv
     if len(args) < 1:
-        print("Usage: python clean_workflow.py [--rectangles-only] <wall_mask_path_or_folder> [output_dir]")
+        print("Usage: python clean_workflow.py [--rectangles-only] [--edited-json=/path/to/roof_rectangles_edited.json] <wall_mask_path_or_folder> [output_dir]")
         sys.exit(1)
     path = args[0]
     out = args[1] if len(args) > 1 else "output"
-    run_clean_workflow(path, out, rectangles_only=rectangles_only)
+    run_clean_workflow(path, out, rectangles_only=rectangles_only, edited_json_path=edited_json_path)

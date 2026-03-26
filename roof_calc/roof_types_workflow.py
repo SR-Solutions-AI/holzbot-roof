@@ -45,6 +45,26 @@ def _section_rect_segments(section: Dict[str, Any]) -> List[List[List[float]]]:
     return segs
 
 
+def _section_centers(sections: List[Dict[str, Any]]) -> List[Tuple[float, float]]:
+    """Centrele dreptunghiurilor (bounding_rect), deduplicate."""
+    out: List[Tuple[float, float]] = []
+    seen: set = set()
+    for sec in (sections or []):
+        br = sec.get("bounding_rect") or []
+        if len(br) < 3:
+            continue
+        xs = [float(p[0]) for p in br]
+        ys = [float(p[1]) for p in br]
+        cx = (min(xs) + max(xs)) / 2.0
+        cy = (min(ys) + max(ys)) / 2.0
+        k = (round(cx, 2), round(cy, 2))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append((cx, cy))
+    return out
+
+
 def _rect_polygon(sec: Dict[str, Any]):
     from shapely.geometry import Polygon as ShapelyPolygon
 
@@ -432,10 +452,13 @@ def _get_pyramid_diagonal_segments(
     sections: List[Dict[str, Any]],
     upper_floor_sections: Optional[List[Dict[str, Any]]] = None,
     shorten_to_midpoint: bool = False,
+    use_extended_ridge: bool = True,
 ) -> List[List[List[float]]]:
     """
     Diagonale piramidă 4 ape: din colțuri către ridge, max 45°.
-    Folosim ridge extins (poate ieși din dreptunghi) – diagonalele pot ieși din dreptunghi până la jumătate până la intersecție.
+    use_extended_ridge:
+    - True  -> folosește ridge extins (comportament util la 4.5_w)
+    - False -> folosește ridge-ul secțiunii (ține capetele în interior la 4_w)
     shorten_to_midpoint: pentru 4.5_w, desenăm doar jumătatea de la colț la mijlocul diagonalei (nu de la mijloc la ridge).
     """
     from roof_calc.overhang import extend_secondary_sections_to_main_ridge
@@ -446,7 +469,7 @@ def _get_pyramid_diagonal_segments(
     segs: List[List[List[float]]] = []
     for sec, sec_ext in zip(sections, extended):
         br = sec.get("bounding_rect") or []
-        ridge = sec_ext.get("ridge_line") or []
+        ridge = (sec_ext.get("ridge_line") if use_extended_ridge else sec.get("ridge_line")) or []
         if len(br) < 3 or len(ridge) < 2:
             continue
 
@@ -593,6 +616,7 @@ def _chain_segments_to_rings(
         ring = [p0, p1]
         used[start_idx] = True
         current = p1
+        closed = False
         while True:
             found = False
             for i, (a, b) in enumerate(segs):
@@ -613,16 +637,14 @@ def _chain_segments_to_rings(
             if not found:
                 break
             if point_eq(current, ring[0]) and len(ring) >= 3:
-                ring.pop()
-                rings.append(ring)
+                closed = True
                 break
-        if not found:
-            break
-        if point_eq(current, ring[0]) and len(ring) >= 3:
-            break
-        if len(ring) >= 3 and point_eq(ring[-1], ring[0]):
-            ring.pop()
-            rings.append(ring)
+        # Nu întrerupem procesarea altor componente: vrem TOATE inelele.
+        if closed:
+            if len(ring) >= 2 and point_eq(ring[-1], ring[0]):
+                ring = ring[:-1]
+            if len(ring) >= 3:
+                rings.append(ring)
     return rings
 
 
@@ -809,7 +831,7 @@ def _build_base_segments_45w(
     if len(seg_all) < 3:
         return list(seg_contour) + list(seg_orange or []) + list(seg_pyramid)
     try:
-        from shapely.geometry import LineString
+        from shapely.geometry import LineString, Point
         from shapely.ops import polygonize_full, unary_union
         lines = []
         for s in seg_all:
@@ -1009,19 +1031,20 @@ def _overhang_segments_from_contour(
                     if not getattr(merged, "is_empty", True):
                         buffered = merged.buffer(offset_px, resolution=2, join_style=2)
                         if buffered and not getattr(buffered, "is_empty", True):
-                            # Poate rezulta MultiPolygon dacă dreptunghiurile nu se ating — unim
-                            if hasattr(buffered, "geoms"):
-                                buffered = _shapely_union(list(buffered.geoms))
-                            ext = getattr(buffered, "exterior", None)
-                            if ext is not None:
+                            # IMPORTANT: păstrăm TOATE componentele overhang (ex. 2 poligoane separate în 4_w).
+                            ge = list(getattr(buffered, "geoms", None) or [buffered])
+                            for gg in ge:
+                                ext = getattr(gg, "exterior", None)
+                                if ext is None:
+                                    continue
                                 coords = list(getattr(ext, "coords", []))
                                 for i in range(len(coords) - 1):
                                     out_segs.append([
                                         [float(coords[i][0]), float(coords[i][1])],
                                         [float(coords[i + 1][0]), float(coords[i + 1][1])],
                                     ])
-                                if out_segs:
-                                    return out_segs
+                            if out_segs:
+                                return out_segs
             except Exception:
                 pass
 
@@ -1294,6 +1317,222 @@ def _merge_overlapping_overhangs(segments_overhang: List[List[List[float]]]) -> 
     except Exception:
         pass
     return segments_overhang
+
+
+def _overhang_overlap_points(
+    segments_overhang: List[List[List[float]]],
+    tol: float = 1e-6,
+) -> List[Tuple[float, float]]:
+    """
+    Detectează puncte reprezentative pentru segmente de overhang care se suprapun coliniar.
+    Returnează midpoint-ul porțiunii comune pentru fiecare pereche detectată.
+    """
+    out: List[Tuple[float, float]] = []
+    n = len(segments_overhang or [])
+    if n < 2:
+        return out
+    for i in range(n):
+        s1 = segments_overhang[i]
+        if len(s1) < 2:
+            continue
+        a0 = (float(s1[0][0]), float(s1[0][1]))
+        a1 = (float(s1[1][0]), float(s1[1][1]))
+        adx, ady = a1[0] - a0[0], a1[1] - a0[1]
+        al2 = adx * adx + ady * ady
+        if al2 < tol:
+            continue
+        for j in range(i + 1, n):
+            s2 = segments_overhang[j]
+            if len(s2) < 2:
+                continue
+            b0 = (float(s2[0][0]), float(s2[0][1]))
+            b1 = (float(s2[1][0]), float(s2[1][1]))
+            bdx, bdy = b1[0] - b0[0], b1[1] - b0[1]
+            bl2 = bdx * bdx + bdy * bdy
+            if bl2 < tol:
+                continue
+            # paralelism + coliniaritate
+            cross = adx * bdy - ady * bdx
+            if abs(cross) > 1e-4:
+                continue
+            cross0 = adx * (b0[1] - a0[1]) - ady * (b0[0] - a0[0])
+            cross1 = adx * (b1[1] - a0[1]) - ady * (b1[0] - a0[0])
+            if abs(cross0) > 1e-3 or abs(cross1) > 1e-3:
+                continue
+            # proiectăm pe axa dominantă și verificăm intervalul comun
+            use_x = abs(adx) >= abs(ady)
+            if use_x:
+                a_min, a_max = sorted((a0[0], a1[0]))
+                b_min, b_max = sorted((b0[0], b1[0]))
+                o_min = max(a_min, b_min)
+                o_max = min(a_max, b_max)
+                if o_max - o_min <= 0.5:
+                    continue
+                x = (o_min + o_max) * 0.5
+                y = a0[1] if abs(ady) < tol else (a0[1] + ((x - a0[0]) / (adx if abs(adx) > tol else 1.0)) * ady)
+            else:
+                a_min, a_max = sorted((a0[1], a1[1]))
+                b_min, b_max = sorted((b0[1], b1[1]))
+                o_min = max(a_min, b_min)
+                o_max = min(a_max, b_max)
+                if o_max - o_min <= 0.5:
+                    continue
+                y = (o_min + o_max) * 0.5
+                x = a0[0] if abs(adx) < tol else (a0[0] + ((y - a0[1]) / (ady if abs(ady) > tol else 1.0)) * adx)
+            out.append((float(x), float(y)))
+    if not out:
+        return out
+    # deduplicare
+    uniq = list(dict.fromkeys([(round(p[0], 2), round(p[1], 2)) for p in out]))
+    return [(float(p[0]), float(p[1])) for p in uniq]
+
+
+def _remove_interior_overhang_segments(
+    segments_overhang: List[List[List[float]]],
+    boundary_tol_px: float = 1.0,
+) -> List[List[List[float]]]:
+    """
+    Flood-fill din exterior: păstrează doar segmentele de overhang „atinse” de exterior.
+    Segmentele aflate complet în interior (neatinse de exterior) sunt eliminate.
+    """
+    if not segments_overhang or len(segments_overhang) < 3:
+        return segments_overhang
+    try:
+        from shapely.geometry import LineString
+        from shapely.ops import polygonize_full, unary_union
+
+        lines = []
+        for s in segments_overhang:
+            if len(s) < 2:
+                continue
+            p0 = (float(s[0][0]), float(s[0][1]))
+            p1 = (float(s[1][0]), float(s[1][1]))
+            if (p0[0] - p1[0]) ** 2 + (p0[1] - p1[1]) ** 2 <= 1e-10:
+                continue
+            lines.append(LineString([p0, p1]))
+        if len(lines) < 3:
+            return segments_overhang
+        # Noding: tăiem segmentele în intersecții, astfel încât „segment” = linie între două puncte blue.
+        noded_geom = unary_union(lines)
+        noded_segments: List[List[List[float]]] = []
+        noded_geoms = list(getattr(noded_geom, "geoms", None) or [noded_geom])
+        for g in noded_geoms:
+            coords = list(getattr(g, "coords", []))
+            if len(coords) < 2:
+                continue
+            for i in range(len(coords) - 1):
+                x0, y0 = float(coords[i][0]), float(coords[i][1])
+                x1, y1 = float(coords[i + 1][0]), float(coords[i + 1][1])
+                if (x0 - x1) ** 2 + (y0 - y1) ** 2 <= 1e-8:
+                    continue
+                noded_segments.append([[x0, y0], [x1, y1]])
+        if not noded_segments:
+            noded_segments = [[[float(s[0][0]), float(s[0][1])], [float(s[1][0]), float(s[1][1])]]
+                              for s in segments_overhang if len(s) >= 2]
+
+        polys, _, _, _ = polygonize_full(lines)
+        geoms = list(getattr(polys, "geoms", None) or [polys])
+        valid = [g for g in geoms if g is not None and not getattr(g, "is_empty", True)]
+        if not valid:
+            return segments_overhang
+        union_poly = unary_union(valid)
+        if union_poly is None or getattr(union_poly, "is_empty", True):
+            return segments_overhang
+
+        xs: List[float] = []
+        ys: List[float] = []
+        for s in noded_segments:
+            if len(s) >= 2:
+                xs.extend([float(s[0][0]), float(s[1][0])])
+                ys.extend([float(s[0][1]), float(s[1][1])])
+        if not xs or not ys:
+            return segments_overhang
+
+        pad = 8
+        minx = int(math.floor(min(xs))) - pad
+        miny = int(math.floor(min(ys))) - pad
+        maxx = int(math.ceil(max(xs))) + pad
+        maxy = int(math.ceil(max(ys))) + pad
+        w = max(16, maxx - minx + 1)
+        h = max(16, maxy - miny + 1)
+
+        # mask suprafață overhang (umplută) -> flood-fill exterior pe complement
+        occ = np.zeros((h, w), dtype=np.uint8)  # 255 = overhang
+        poly_geoms = list(getattr(union_poly, "geoms", None) or [union_poly])
+        for g in poly_geoms:
+            if g is None or getattr(g, "is_empty", True):
+                continue
+            ext = getattr(g, "exterior", None)
+            if ext is None:
+                continue
+            coords = list(getattr(ext, "coords", []))
+            if len(coords) < 4:
+                continue
+            pts = np.array(
+                [[int(round(float(c[0]) - minx)), int(round(float(c[1]) - miny))] for c in coords[:-1]],
+                dtype=np.int32,
+            )
+            cv2.fillPoly(occ, [pts.reshape(-1, 1, 2)], 255)
+            # Scoatem găurile interioare dacă există
+            for ring in getattr(g, "interiors", []):
+                ic = list(getattr(ring, "coords", []))
+                if len(ic) < 4:
+                    continue
+                ipts = np.array(
+                    [[int(round(float(c[0]) - minx)), int(round(float(c[1]) - miny))] for c in ic[:-1]],
+                    dtype=np.int32,
+                )
+                cv2.fillPoly(occ, [ipts.reshape(-1, 1, 2)], 0)
+
+        empty = np.where(occ == 0, 0, 255).astype(np.uint8)  # 0=gol, 255=ocupat
+        flooded = empty.copy()
+        corner_seeds = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
+        for sx, sy in corner_seeds:
+            if 0 <= sx < w and 0 <= sy < h and flooded[sy, sx] == 0:
+                flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+                cv2.floodFill(flooded, flood_mask, (sx, sy), 127)
+        exterior = (flooded == 127).astype(np.uint8)
+        # Permitem o vecinătate mică astfel încât un segment pe frontieră să fie detectat robust.
+        exterior_touch = cv2.dilate(exterior, np.ones((3, 3), dtype=np.uint8), iterations=1)
+
+        kept: List[List[List[float]]] = []
+        def _is_exterior_idx(ix: int, iy: int) -> bool:
+            if ix < 0 or iy < 0 or ix >= w or iy >= h:
+                return True
+            return bool(exterior_touch[iy, ix] > 0)
+        for s in noded_segments:
+            if len(s) < 2:
+                continue
+            x0, y0 = float(s[0][0]), float(s[0][1])
+            x1, y1 = float(s[1][0]), float(s[1][1])
+            dx = x1 - x0
+            dy = y1 - y0
+            L = (dx * dx + dy * dy) ** 0.5
+            if L < 1e-9:
+                continue
+            # Probă robustă: eșantionăm de-a lungul segmentului și verificăm pe ambele părți
+            # ale normalei dacă ating zona flood-filled exterior.
+            nx = -dy / L
+            ny = dx / L
+            off = max(1.0, float(boundary_tol_px))
+            sample_count = max(8, int(L / 2.0))
+            touched = 0
+            for k in range(sample_count + 1):
+                t = float(k) / float(sample_count)
+                sx = x0 + t * dx
+                sy = y0 + t * dy
+                p1x = int(round((sx + nx * off) - minx))
+                p1y = int(round((sy + ny * off) - miny))
+                p2x = int(round((sx - nx * off) - minx))
+                p2y = int(round((sy - ny * off) - miny))
+                if _is_exterior_idx(p1x, p1y) or _is_exterior_idx(p2x, p2y):
+                    touched += 1
+            touch_ratio = float(touched) / float(sample_count + 1)
+            if touch_ratio >= 0.5:
+                kept.append([[x0, y0], [x1, y1]])
+        return kept if kept else noded_segments
+    except Exception:
+        return segments_overhang
 
 
 def _filter_overhang_near_base(
@@ -2245,6 +2484,168 @@ def _get_ridge_segments(sections: List[Dict[str, Any]]) -> List[List[List[float]
     return segs
 
 
+def _get_ridge_segments_per_rectangle(sections: List[Dict[str, Any]]) -> List[List[List[float]]]:
+    """
+    Ridge explicit per dreptunghi (secțiune): fiecare dreptunghi este tăiat în 2.
+    Pentru dreptunghiuri lipite, ridge-ul secundar se prelungește până la ridge-ul principal.
+    """
+    from roof_calc.overhang import extend_secondary_sections_to_main_ridge
+
+    out: List[List[List[float]]] = []
+    if not sections:
+        return out
+
+    # IMPORTANT: extindem ridge-uri doar în componente STRICT lipite.
+    # Nu folosim "aproape lipite" aici, ca să nu unim dreptunghiuri separate.
+    n = len(sections)
+    polys: List[Any] = []
+    for s in sections:
+        p = _rect_polygon(s)
+        polys.append(p)
+    parent = list(range(n))
+
+    def _find(x: int) -> int:
+        if parent[x] != x:
+            parent[x] = _find(parent[x])
+        return parent[x]
+
+    def _union(a: int, b: int) -> None:
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n):
+        pi = polys[i]
+        if pi is None or getattr(pi, "is_empty", True):
+            continue
+        for j in range(i + 1, n):
+            pj = polys[j]
+            if pj is None or getattr(pj, "is_empty", True):
+                continue
+            try:
+                # Strict: doar dacă se ating/intersectează efectiv.
+                if bool(pi.touches(pj)) or bool(pi.intersects(pj)):
+                    _union(i, j)
+            except Exception:
+                continue
+
+    comps: Dict[int, List[Dict[str, Any]]] = {}
+    for idx, sec in enumerate(sections):
+        comps.setdefault(_find(idx), []).append(sec)
+
+    # Extindem separat pe fiecare componentă strict lipită.
+    for comp_secs in comps.values():
+        extended = extend_secondary_sections_to_main_ridge(comp_secs or [])
+        for sec in extended:
+            ridge = sec.get("ridge_line") or []
+            if len(ridge) < 2:
+                continue
+            out.append([
+                [float(ridge[0][0]), float(ridge[0][1])],
+                [float(ridge[1][0]), float(ridge[1][1])],
+            ])
+
+    # Fallback minimal: dacă nu s-a produs nimic, revenim la ridge-urile brute per dreptunghi.
+    if not out:
+        for sec in sections:
+            ridge = sec.get("ridge_line") or []
+            if len(ridge) < 2:
+                continue
+            out.append([
+                [float(ridge[0][0]), float(ridge[0][1])],
+                [float(ridge[1][0]), float(ridge[1][1])],
+            ])
+        return out
+
+    # Dedup robust (aceeași secțiune poate ieși de două ori după extinderi interne).
+    seen = set()
+    dedup: List[List[List[float]]] = []
+    for s in out:
+        if len(s) < 2:
+            continue
+        a = (round(float(s[0][0]), 2), round(float(s[0][1]), 2))
+        b = (round(float(s[1][0]), 2), round(float(s[1][1]), 2))
+        key = (a, b) if a <= b else (b, a)
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append([[float(s[0][0]), float(s[0][1])], [float(s[1][0]), float(s[1][1])]])
+    return dedup
+
+
+def _dedupe_near_parallel_ridges_2w(
+    segs: List[List[List[float]]],
+    tol_offset: float = 6.0,
+    min_overlap: float = 20.0,
+) -> List[List[List[float]]]:
+    """
+    Elimină duplicatele de ridge pentru 2_w când două segmente aproape paralele
+    ajung în același dreptunghi după extinderile pe secțiuni.
+    Păstrează segmentul mai lung.
+    """
+    if not segs:
+        return []
+
+    def _norm_seg(s: List[List[float]]) -> Optional[Tuple[float, float, float, float]]:
+        if len(s) < 2:
+            return None
+        x1, y1 = float(s[0][0]), float(s[0][1])
+        x2, y2 = float(s[1][0]), float(s[1][1])
+        if (x1, y1) <= (x2, y2):
+            return (x1, y1, x2, y2)
+        return (x2, y2, x1, y1)
+
+    def _axis(s: Tuple[float, float, float, float]) -> str:
+        dx = abs(s[2] - s[0])
+        dy = abs(s[3] - s[1])
+        # În practică ridge-urile la 2_w sunt axiale; păstrăm fallback-ul generic.
+        if dx >= 3.0 * dy:
+            return "h"
+        if dy >= 3.0 * dx:
+            return "v"
+        return "other"
+
+    def _len(s: Tuple[float, float, float, float]) -> float:
+        return ((s[2] - s[0]) ** 2 + (s[3] - s[1]) ** 2) ** 0.5
+
+    def _is_duplicate(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> bool:
+        ax = _axis(a)
+        bx = _axis(b)
+        if ax != bx or ax == "other":
+            return False
+        if ax == "h":
+            # Aproape pe aceeași înălțime + suprapunere pe X.
+            if abs(((a[1] + a[3]) * 0.5) - ((b[1] + b[3]) * 0.5)) > tol_offset:
+                return False
+            a0, a1 = sorted([a[0], a[2]])
+            b0, b1 = sorted([b[0], b[2]])
+        else:
+            # Aproape pe aceeași poziție X + suprapunere pe Y.
+            if abs(((a[0] + a[2]) * 0.5) - ((b[0] + b[2]) * 0.5)) > tol_offset:
+                return False
+            a0, a1 = sorted([a[1], a[3]])
+            b0, b1 = sorted([b[1], b[3]])
+        overlap = max(0.0, min(a1, b1) - max(a0, b0))
+        return overlap >= min_overlap
+
+    kept: List[Tuple[float, float, float, float]] = []
+    for raw in segs:
+        cur = _norm_seg(raw)
+        if cur is None:
+            continue
+        replaced = False
+        for idx, k in enumerate(kept):
+            if _is_duplicate(cur, k):
+                if _len(cur) > _len(k):
+                    kept[idx] = cur
+                replaced = True
+                break
+        if not replaced:
+            kept.append(cur)
+
+    return [[[s[0], s[1]], [s[2], s[3]]] for s in kept]
+
+
 def _seg_intersect(
     a1: Tuple[float, float], a2: Tuple[float, float],
     b1: Tuple[float, float], b2: Tuple[float, float],
@@ -2402,6 +2803,7 @@ def _compute_overhang_ridge_pts(
         half = max(0.1 * L, L)
         e0 = (r0[0] - half * (dx / L), r0[1] - half * (dy / L))
         e1 = (r1[0] + half * (dx / L), r1[1] + half * (dy / L))
+        hits_for_ridge: List[Tuple[float, Tuple[float, float]]] = []
         for oseg in segments_overhang:
             if len(oseg) < 2:
                 continue
@@ -2423,8 +2825,109 @@ def _compute_overhang_ridge_pts(
                 if abs(dot) > thresh * len_r * len_o:
                     continue
             if not _near_ridge_intersection(r0) and not _near_ridge_intersection(r1):
-                out_pts.append(pt)
-    return [p for p in out_pts if not _near_ridge_intersection(p)]
+                t = (pt[0] - e0[0]) * (e1[0] - e0[0]) + (pt[1] - e0[1]) * (e1[1] - e0[1])
+                hits_for_ridge.append((t, pt))
+        # Pentru fiecare ridge păstrăm capetele (extremele) pe direcția lui.
+        if hits_for_ridge:
+            hits_for_ridge.sort(key=lambda it: it[0])
+            out_pts.append(hits_for_ridge[0][1])
+            if len(hits_for_ridge) > 1:
+                out_pts.append(hits_for_ridge[-1][1])
+            else:
+                # fallback: dacă există un singur hit valid, îl păstrăm (situații degenerate)
+                out_pts.append(hits_for_ridge[0][1])
+
+    dedup: List[Tuple[float, float]] = []
+    seen = set()
+    for p in out_pts:
+        if _near_ridge_intersection(p):
+            continue
+        k = (round(float(p[0]), 2), round(float(p[1]), 2))
+        if k in seen:
+            continue
+        seen.add(k)
+        dedup.append((float(p[0]), float(p[1])))
+    return dedup
+
+
+def _filter_ridge_pts_by_anchor_segments(
+    ridge_pts: List[Tuple[float, float]],
+    anchor_segments: List[List[List[float]]],
+    match_tol: float = 2.0,
+) -> List[Tuple[float, float]]:
+    """
+    Păstrează darkblue doar dacă au sursă gray (anchor segment),
+    iar pentru fiecare gray păstrează doar darkblue-ul cel mai apropiat.
+    """
+    if not ridge_pts or not anchor_segments:
+        return []
+    by_gray: Dict[Tuple[float, float], Tuple[float, Tuple[float, float]]] = {}
+    for rp in ridge_pts:
+        rx, ry = float(rp[0]), float(rp[1])
+        best_gray = None
+        best_d2 = 1e30
+        for s in anchor_segments:
+            if len(s) < 2:
+                continue
+            sx, sy = float(s[0][0]), float(s[0][1])  # sursa (blue/corner)
+            gx, gy = float(s[1][0]), float(s[1][1])  # anchor gray
+            d2_src = (rx - sx) ** 2 + (ry - sy) ** 2
+            if d2_src <= match_tol * match_tol:
+                d2_gray = (rx - gx) ** 2 + (ry - gy) ** 2
+                if d2_gray < best_d2:
+                    best_d2 = d2_gray
+                    best_gray = (round(gx, 2), round(gy, 2))
+        if best_gray is None:
+            continue
+        cur = by_gray.get(best_gray)
+        if cur is None or best_d2 < cur[0]:
+            by_gray[best_gray] = (best_d2, (rx, ry))
+    out: List[Tuple[float, float]] = []
+    seen = set()
+    for _, (_, p) in by_gray.items():
+        k = (round(float(p[0]), 2), round(float(p[1]), 2))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append((float(p[0]), float(p[1])))
+    return out
+
+
+def _filter_ridge_pts_by_nearest_gray(
+    ridge_pts: List[Tuple[float, float]],
+    gray_pts: List[Tuple[float, float]],
+) -> List[Tuple[float, float]]:
+    """
+    Variantă fallback pentru lines: dacă nu există gray -> fără darkblue.
+    Pentru fiecare gray păstrăm doar darkblue-ul cel mai apropiat.
+    """
+    if not ridge_pts or not gray_pts:
+        return []
+    by_gray: Dict[Tuple[float, float], Tuple[float, Tuple[float, float]]] = {}
+    for rp in ridge_pts:
+        rx, ry = float(rp[0]), float(rp[1])
+        best_g = None
+        best_d2 = 1e30
+        for g in gray_pts:
+            gx, gy = float(g[0]), float(g[1])
+            d2 = (rx - gx) ** 2 + (ry - gy) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best_g = (round(gx, 2), round(gy, 2))
+        if best_g is None:
+            continue
+        cur = by_gray.get(best_g)
+        if cur is None or best_d2 < cur[0]:
+            by_gray[best_g] = (best_d2, (rx, ry))
+    out: List[Tuple[float, float]] = []
+    seen = set()
+    for _, (_, p) in by_gray.items():
+        k = (round(float(p[0]), 2), round(float(p[1]), 2))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append((float(p[0]), float(p[1])))
+    return out
 
 
 def _point_on_segment_seg(
@@ -2722,6 +3225,7 @@ def _overhang_anchor_segments(
                 anchor_candidates_45 = list(dict.fromkeys([(round(c[0], 4), round(c[1], 4)) for c in anchor_candidates_45]))
                 anchor_candidates_45 = [(c[0], c[1]) for c in anchor_candidates_45]
                 if overhang_poly_anchor is not None:
+                    anchor_candidates_45_all = list(anchor_candidates_45)
                     try:
                         from shapely.geometry import Point as ShapelyPoint
                         _tol = 1e-6
@@ -2734,6 +3238,9 @@ def _overhang_anchor_segments(
                         anchor_candidates_45 = [c for c in anchor_candidates_45 if _strictly_inside_45(c)]
                     except Exception:
                         pass
+                    # Fallback: dacă filtrul strict golește setul, folosim candidații inițiali
+                    if not anchor_candidates_45:
+                        anchor_candidates_45 = anchor_candidates_45_all
                 if anchor_candidates_45:
                     best_d2 = 1e30
                     for q in anchor_candidates_45:
@@ -2760,6 +3267,7 @@ def _overhang_anchor_segments(
                     continue
                 # Doar colțuri STRICT ÎN INTERIORUL overhang-ului
                 if overhang_poly_anchor is not None:
+                    anchor_candidates_all = list(anchor_candidates)
                     try:
                         from shapely.geometry import Point as ShapelyPoint
                         _tol = 1e-6
@@ -2772,6 +3280,9 @@ def _overhang_anchor_segments(
                         anchor_candidates = [c for c in anchor_candidates if _strictly_inside_oh(c)]
                     except Exception:
                         pass
+                    # Fallback: nu lăsăm overhang fără fețe când filtrul strict elimină tot
+                    if not anchor_candidates:
+                        anchor_candidates = anchor_candidates_all
                 if not anchor_candidates:
                     continue
                 best_d2 = 1e30
@@ -2783,6 +3294,7 @@ def _overhang_anchor_segments(
         elif use_interior and anchor_candidates:
             # Doar colțuri interioare STRICT ÎN INTERIORUL overhang-ului
             if overhang_poly_anchor is not None:
+                anchor_candidates_all = list(anchor_candidates)
                 try:
                     from shapely.geometry import Point as ShapelyPoint
                     _tol = 1e-6
@@ -2795,6 +3307,9 @@ def _overhang_anchor_segments(
                     anchor_candidates = [c for c in anchor_candidates if _strictly_inside_int(c)]
                 except Exception:
                     pass
+                # Fallback pentru colțuri interioare: păstrăm varianta nefiltrată dacă strict-ul elimină tot
+                if not anchor_candidates:
+                    anchor_candidates = anchor_candidates_all
             if not anchor_candidates:
                 continue
             best_d2 = 1e30
@@ -3273,19 +3788,45 @@ def _get_ridge_segments_45w_trimmed(
 
 
 def _get_magenta_segments(sections: List[Dict[str, Any]]) -> List[List[List[float]]]:
-    """Linii mov doar când ≥2 ridge-uri se intersectează."""
-    if not _has_ridge_intersection(sections):
+    """Linii mov doar când ≥2 ridge-uri se intersectează, pe aceeași componentă."""
+    if not sections:
         return []
     from roof_calc.overhang import ridge_intersection_corner_lines
 
-    corner_lines = ridge_intersection_corner_lines(sections, per_section=False)
     segs: List[List[List[float]]] = []
-    for item in corner_lines:
-        pt, corners, _ = item
-        ix, iy = float(pt[0]), float(pt[1])
-        for c in corners:
-            segs.append([[ix, iy], [float(c[0]), float(c[1])]])
+    comps = _section_connected_components(sections)
+    if not comps:
+        comps = [list(range(len(sections)))]
+    for comp in comps:
+        comp_secs = [sections[i] for i in comp if 0 <= i < len(sections)]
+        if len(comp_secs) < 2 or not _has_ridge_intersection(comp_secs):
+            continue
+        corner_lines = ridge_intersection_corner_lines(comp_secs, per_section=False)
+        for item in corner_lines:
+            pt, corners, _ = item
+            ix, iy = float(pt[0]), float(pt[1])
+            for c in corners:
+                segs.append([[ix, iy], [float(c[0]), float(c[1])]])
     return segs
+
+
+def _ridge_corner_lines_by_component(sections: List[Dict[str, Any]]) -> Optional[List[Any]]:
+    """Corner lines per componentă, ca să evităm legături între dreptunghiuri separate."""
+    if not sections:
+        return None
+    from roof_calc.overhang import ridge_intersection_corner_lines
+
+    out: List[Any] = []
+    comps = _section_connected_components(sections)
+    if not comps:
+        comps = [list(range(len(sections)))]
+    for comp in comps:
+        comp_secs = [sections[i] for i in comp if 0 <= i < len(sections)]
+        if len(comp_secs) < 2 or not _has_ridge_intersection(comp_secs):
+            continue
+        out.extend(ridge_intersection_corner_lines(comp_secs, per_section=False))
+    return out or None
+
 
 
 def _get_magenta_segments_45w(
@@ -3590,12 +4131,23 @@ def _numbered_faces_from_polygons(
     return result
 
 
+def _centroid_in_roof_footprint(
+    cx: float, cy: float, wall_mask: np.ndarray, thresh: int = 10
+) -> bool:
+    """True dacă centroidul cade în zona albă a măștii (amprenta acoperișului)."""
+    h, w = wall_mask.shape[:2]
+    ix = max(0, min(w - 1, int(round(cx))))
+    iy = max(0, min(h - 1, int(round(cy))))
+    return float(wall_mask[iy, ix]) > float(thresh)
+
+
 def _draw_faces_png(
     wall_mask: np.ndarray,
     polygons: List[List[Tuple[float, float]]],
     output_path: Path,
     roof_type: str = "",
     seed: int = 42,
+    used_points: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
     """Desenează poligoane cu culori random și transparență 50%."""
     try:
@@ -3619,11 +4171,41 @@ def _draw_faces_png(
             continue
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
-        color = (rng.random(), rng.random(), rng.random(), 0.5)
-        ax.fill(xs, ys, facecolor=color, edgecolor="none")
         cx = sum(xs) / len(xs)
         cy = sum(ys) / len(ys)
-        ax.text(cx, cy, str(idx + 1), ha="center", va="center", fontsize=12, fontweight="bold", color="black")
+        # Overhang = față în banda din lines (nu pe amprenta acoperișului). Nu folosim indexul în listă
+        # (ordinea poate amesteca fețe normale cu overhang → numere albe greșit în interior).
+        is_overhang_face = not _centroid_in_roof_footprint(cx, cy, wall_mask)
+        color = (rng.random(), rng.random(), rng.random(), 0.5)
+        ax.fill(xs, ys, facecolor=color, edgecolor="none")
+        ax.text(
+            cx,
+            cy,
+            str(idx + 1),
+            ha="center",
+            va="center",
+            fontsize=12,
+            fontweight="bold",
+            color=("white" if is_overhang_face else "black"),
+        )
+    # Debug/trace: punctele folosite la generarea fețelor overhang
+    if used_points:
+        for p in used_points:
+            try:
+                x = float(p.get("x"))
+                y = float(p.get("y"))
+                kind = str(p.get("kind") or "")
+            except Exception:
+                continue
+            if kind == "darkblue":
+                c = "darkblue"
+            elif kind == "gray":
+                c = "gray"
+            elif kind == "yellow":
+                c = "yellow"
+            else:
+                c = "lightblue"
+            ax.scatter([x], [y], c=c, s=70, zorder=20, edgecolors="black", linewidths=1)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         plt.savefig(str(output_path), dpi=150, bbox_inches="tight")
@@ -3654,7 +4236,8 @@ def _draw_lines_and_save(
     segments_overhang_inner: Optional[List[List[List[float]]]] = None,
     segments_overhang_ridge: Optional[List[List[List[float]]]] = None,
     sections: Optional[List[Dict[str, Any]]] = None,
-) -> bool:
+    return_points: bool = False,
+) -> Any:
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -3707,6 +4290,57 @@ def _draw_lines_and_save(
                 s = _offset_seg(seg, _off * 1)
                 ax.plot([s[0][0], s[1][0]], [s[0][1], s[1][1]], color="magenta", linewidth=_lw, linestyle="-", alpha=0.9, zorder=3)
 
+    # Fill bandă overhang (zona dintre outer și dreptunghiurile acoperișului) - lightblue 50% transparent.
+    # Implementare robustă pe mască: band = outer_mask - wall_mask (nu poate acoperi interiorul).
+    if segments_overhang:
+        try:
+            from shapely.geometry import LineString
+            from shapely.ops import polygonize_full
+
+            outer_mask = np.zeros((h, w), dtype=np.uint8)
+            oh_lines = [
+                LineString([(float(s[0][0]), float(s[0][1])), (float(s[1][0]), float(s[1][1]))])
+                for s in segments_overhang if len(s) >= 2
+                and (float(s[0][0]) - float(s[1][0])) ** 2 + (float(s[0][1]) - float(s[1][1])) ** 2 > 1e-6
+            ]
+            if len(oh_lines) >= 3:
+                polys, _, _, _ = polygonize_full(oh_lines)
+                geoms = [g for g in (getattr(polys, "geoms", None) or [polys]) if g is not None and not getattr(g, "is_empty", True)]
+                for g in geoms:
+                    ext = getattr(g, "exterior", None)
+                    if ext is None:
+                        continue
+                    coords = list(getattr(ext, "coords", []))
+                    if len(coords) < 4:
+                        continue
+                    pts = np.array(
+                        [[int(round(float(c[0]))), int(round(float(c[1])))] for c in coords[:-1]],
+                        dtype=np.int32,
+                    ).reshape(-1, 1, 2)
+                    cv2.fillPoly(outer_mask, [pts], 255)
+                    for ring in getattr(g, "interiors", []):
+                        ic = list(getattr(ring, "coords", []))
+                        if len(ic) < 4:
+                            continue
+                        ipts = np.array(
+                            [[int(round(float(c[0]))), int(round(float(c[1])))] for c in ic[:-1]],
+                            dtype=np.int32,
+                        ).reshape(-1, 1, 2)
+                        cv2.fillPoly(outer_mask, [ipts], 0)
+
+                inner_mask = (wall_mask > 0).astype(np.uint8) * 255
+                band_mask = ((outer_mask > 0) & (inner_mask == 0)).astype(np.uint8)
+
+                rgba = np.zeros((h, w, 4), dtype=np.float32)
+                rgba[..., 0] = 0.45
+                rgba[..., 1] = 0.80
+                rgba[..., 2] = 1.00
+                rgba[..., 3] = 0.0
+                rgba[..., 3][band_mask > 0] = 0.50
+                ax.imshow(rgba, extent=[0, w, h, 0], interpolation="nearest", zorder=2.5)
+        except Exception:
+            pass
+
     if segments_overhang:
         for seg in segments_overhang:
             if len(seg) >= 2:
@@ -3724,6 +4358,9 @@ def _draw_lines_and_save(
     # Buline: colțuri overhang = albastru deschis; unde ridge-urile prelungite ating overhang = albastru închis
     overhang_corner_pts: List[Tuple[float, float]] = []
     overhang_ridge_pts: List[Tuple[float, float]] = []
+    overhang_intersection_pts: List[Tuple[float, float]] = []
+    lines_gray_anchor_pts: List[Tuple[float, float]] = []
+    lines_ridge_anchor_pairs: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
     if segments_overhang:
         # Colțuri overhang = toate capetele segmentelor de overhang
         for seg in segments_overhang:
@@ -3785,6 +4422,14 @@ def _draw_lines_and_save(
                     o1 = (float(oseg[1][0]), float(oseg[1][1]))
                     pt = _segment_segment_intersection(e0, e1, o0, o1)
                     if pt is not None:
+                        # Acceptăm punctul doar dacă este pe PRELUNGIREA ridge-ului (dincolo de capete),
+                        # nu pe proiecția care cade pe segmentul original.
+                        seg_len_sq = dx * dx + dy * dy
+                        if seg_len_sq < 1e-20:
+                            continue
+                        t_on_ridge = ((pt[0] - r0[0]) * dx + (pt[1] - r0[1]) * dy) / seg_len_sq
+                        if -1e-6 <= t_on_ridge <= 1.0 + 1e-6:
+                            continue
                         # 4_w: nu punem buline albastre deloc
                         if roof_type == "4_w":
                             continue
@@ -3808,13 +4453,110 @@ def _draw_lines_and_save(
         if roof_type != "2_w":
             overhang_corner_pts = [p for p in overhang_corner_pts if not _near_ridge_intersection(p)]
         overhang_ridge_pts = [p for p in overhang_ridge_pts if not _near_ridge_intersection(p)]
+        # Garanție: pentru fiecare ridge valid există buline în capete (intersecții extreme cu overhang).
+        try:
+            ridge_ext_pts = _compute_overhang_ridge_pts(segments_ridge, segments_overhang, roof_type, tol=5.0)
+            if ridge_ext_pts:
+                overhang_ridge_pts.extend(ridge_ext_pts)
+                tmp_seen = set()
+                tmp = []
+                for p in overhang_ridge_pts:
+                    k = (round(float(p[0]), 2), round(float(p[1]), 2))
+                    if k in tmp_seen:
+                        continue
+                    tmp_seen.add(k)
+                    tmp.append((float(p[0]), float(p[1])))
+                overhang_ridge_pts = tmp
+        except Exception:
+            pass
+        # Intersecții segment-segment în overhang (inclusiv suprapuneri/încrucișări) -> buline albastre
+        if len(segments_overhang) >= 2:
+            for i in range(len(segments_overhang)):
+                si = segments_overhang[i]
+                if len(si) < 2:
+                    continue
+                a0 = (float(si[0][0]), float(si[0][1]))
+                a1 = (float(si[1][0]), float(si[1][1]))
+                for j in range(i + 1, len(segments_overhang)):
+                    sj = segments_overhang[j]
+                    if len(sj) < 2:
+                        continue
+                    b0 = (float(sj[0][0]), float(sj[0][1]))
+                    b1 = (float(sj[1][0]), float(sj[1][1]))
+                    ip = _segment_intersection_2d(a0, a1, b0, b1)
+                    if ip[0] is None or ip[1] is None:
+                        continue
+                    p = (float(ip[0]), float(ip[1]))
+                    if _near_ridge_intersection(p):
+                        continue
+                    overhang_intersection_pts.append(p)
+        def _incident_dirs(pt: Tuple[float, float], tol: float = 0.8) -> List[Tuple[float, float]]:
+            dirs: List[Tuple[float, float]] = []
+            px, py = pt
+            for s in segments_overhang:
+                if len(s) < 2:
+                    continue
+                a = (float(s[0][0]), float(s[0][1]))
+                b = (float(s[1][0]), float(s[1][1]))
+                # punctul trebuie să fie aproape de segment
+                qx, qy, d2 = _closest_point_on_segment((px, py), a, b)
+                if d2 > tol * tol:
+                    continue
+                da = ((a[0] - px) ** 2 + (a[1] - py) ** 2) ** 0.5
+                db = ((b[0] - px) ** 2 + (b[1] - py) ** 2) ** 0.5
+                if da > 1e-6:
+                    dirs.append(((a[0] - px) / da, (a[1] - py) / da))
+                if db > 1e-6:
+                    dirs.append(((b[0] - px) / db, (b[1] - py) / db))
+            # dedup direcții aproape identice
+            uniq: List[Tuple[float, float]] = []
+            for vx, vy in dirs:
+                ok = True
+                for ux, uy in uniq:
+                    if (vx - ux) * (vx - ux) + (vy - uy) * (vy - uy) <= 0.05 * 0.05:
+                        ok = False
+                        break
+                if ok:
+                    uniq.append((vx, vy))
+            return uniq
+
+        # Eliminăm bulinele de pe trasee drepte (continuitate coliniară),
+        # păstrăm doar intersecțiile reale (T/X/colț).
+        if overhang_intersection_pts:
+            filtered_intersections: List[Tuple[float, float]] = []
+            uniq_pts = list(dict.fromkeys([(round(p[0], 2), round(p[1], 2)) for p in overhang_intersection_pts]))
+            for p in uniq_pts:
+                dirs = _incident_dirs((float(p[0]), float(p[1])))
+                if len(dirs) <= 1:
+                    continue
+                if len(dirs) == 2:
+                    # două direcții opuse -> drum drept, fără bulină
+                    dot = dirs[0][0] * dirs[1][0] + dirs[0][1] * dirs[1][1]
+                    if dot < -0.98:
+                        continue
+                filtered_intersections.append((float(p[0]), float(p[1])))
+            overhang_intersection_pts = filtered_intersections
+        if overhang_corner_pts:
+            filtered_corners: List[Tuple[float, float]] = []
+            uniq_pts = list(dict.fromkeys([(round(p[0], 2), round(p[1], 2)) for p in overhang_corner_pts]))
+            for p in uniq_pts:
+                dirs = _incident_dirs((float(p[0]), float(p[1])))
+                if len(dirs) <= 1:
+                    continue
+                if len(dirs) == 2:
+                    dot = dirs[0][0] * dirs[1][0] + dirs[0][1] * dirs[1][1]
+                    # coliniar/opus = drum drept -> fără bulină lightblue
+                    if dot < -0.98:
+                        continue
+                filtered_corners.append((float(p[0]), float(p[1])))
+            overhang_corner_pts = filtered_corners
         if overhang_corner_pts:
             uniq = list(dict.fromkeys([(round(p[0], 2), round(p[1], 2)) for p in overhang_corner_pts]))
             ax.scatter([p[0] for p in uniq], [p[1] for p in uniq], c="lightblue", s=80, zorder=15, edgecolors="black", linewidths=1)
-        if overhang_ridge_pts:
-            # Buline albastre închis: ridge prelungit → overhang (2_w, 4_w, 4.5_w)
-            uniq = list(dict.fromkeys([(round(p[0], 2), round(p[1], 2)) for p in overhang_ridge_pts]))
-            ax.scatter([p[0] for p in uniq], [p[1] for p in uniq], c="darkblue", s=80, zorder=15, edgecolors="black", linewidths=1)
+        if overhang_intersection_pts:
+            uniq = list(dict.fromkeys([(round(p[0], 2), round(p[1], 2)) for p in overhang_intersection_pts]))
+            ax.scatter([p[0] for p in uniq], [p[1] for p in uniq], c="lightblue", s=80, zorder=15, edgecolors="black", linewidths=1)
+        # Bulinele darkblue se desenează după ce avem gray (anchor), ca să putem filtra corect.
         # Anchor + segment bulină → anchor (ca în 3D)
         if segments_overhang and (overhang_corner_pts or overhang_ridge_pts):
             contour_corners_2d: List[Tuple[float, float]] = []
@@ -3888,26 +4630,53 @@ def _draw_lines_and_save(
             overhang_ridge_set_2d = set(uniq_ridge)
             drawn_anchors: set = set()
             drawn_anchor_positions: List[Tuple[float, float]] = []
+            ridge_anchor_positions: List[Tuple[float, float]] = []
             _anchor_near_tol = 5.0
             def _anchor_near(ax: float, ay: float) -> bool:
                 for (ox, oy) in drawn_anchor_positions:
                     if (ax - ox) ** 2 + (ay - oy) ** 2 <= _anchor_near_tol * _anchor_near_tol:
                         return True
                 return False
+            def _near_base_overhang(x: float, y: float, tol: float = 2.0) -> bool:
+                for s in (segments_overhang_inner or []):
+                    if len(s) < 2:
+                        continue
+                    a = (float(s[0][0]), float(s[0][1]))
+                    b = (float(s[1][0]), float(s[1][1]))
+                    qx, qy, d2 = _closest_point_on_segment((x, y), a, b)
+                    if d2 <= tol * tol:
+                        return True
+                return False
             for pt in uniq_ridge:
                 p = (pt[0], pt[1])
                 if ridge_seg_tuples_2d:
                     best_ax, best_ay, best_d2 = 0.0, 0.0, 1e30
+                    best_t = 0.5
                     for (a, b) in ridge_seg_tuples_2d:
                         qx, qy, d2 = _closest_point_on_segment(p, a, b)
                         if d2 < best_d2:
                             best_d2 = d2
                             best_ax, best_ay = qx, qy
+                            dx_ab = float(b[0] - a[0])
+                            dy_ab = float(b[1] - a[1])
+                            len_sq_ab = dx_ab * dx_ab + dy_ab * dy_ab
+                            if len_sq_ab > 1e-20:
+                                best_t = ((qx - float(a[0])) * dx_ab + (qy - float(a[1])) * dy_ab) / len_sq_ab
+                            else:
+                                best_t = 0.5
+                    # Anchor gri valid doar pe baza overhang (magenta).
+                    if not _near_base_overhang(best_ax, best_ay):
+                        continue
+                    # Nu punem anchor gri în capăt de ridge dacă acel capăt nu intersectează baza overhang.
+                    if (best_t <= 1e-3 or best_t >= 1.0 - 1e-3) and (not _near_base_overhang(best_ax, best_ay)):
+                        continue
                     ka = (round(best_ax, 2), round(best_ay, 2))
                     if not _anchor_near(best_ax, best_ay):
                         drawn_anchors.add(ka)
                         drawn_anchor_positions.append((best_ax, best_ay))
+                        ridge_anchor_positions.append((best_ax, best_ay))
                         ax.scatter([best_ax], [best_ay], c="gray", s=50, zorder=14, edgecolors="black", linewidths=1)
+                    lines_ridge_anchor_pairs.append(((float(p[0]), float(p[1])), (float(best_ax), float(best_ay))))
                     ax.plot([p[0], best_ax], [p[1], best_ay], color="gray", linewidth=_lw, linestyle=":", alpha=0.8, zorder=12)
             for pt in uniq_corners:
                 p = (pt[0], pt[1])
@@ -3958,6 +4727,7 @@ def _draw_lines_and_save(
                         anchor_candidates_45 = list(dict.fromkeys([(round(c[0], 4), round(c[1], 4)) for c in anchor_candidates_45]))
                         anchor_candidates_45 = [(c[0], c[1]) for c in anchor_candidates_45]
                         if overhang_poly_for_anchor is not None:
+                            anchor_candidates_45_all = list(anchor_candidates_45)
                             try:
                                 from shapely.geometry import Point as ShapelyPoint
                                 _tol = 1e-6
@@ -3970,6 +4740,8 @@ def _draw_lines_and_save(
                                 anchor_candidates_45 = [c for c in anchor_candidates_45 if _strictly_inside_45(c)]
                             except Exception:
                                 pass
+                            if not anchor_candidates_45:
+                                anchor_candidates_45 = anchor_candidates_45_all
                         if anchor_candidates_45:
                             best_d2 = 1e30
                             for q in anchor_candidates_45:
@@ -3994,6 +4766,7 @@ def _draw_lines_and_save(
                             continue
                         # Doar colțuri STRICT ÎN INTERIORUL overhang-ului (cyan)
                         if overhang_poly_for_anchor is not None:
+                            anchor_candidates_all = list(anchor_candidates)
                             try:
                                 from shapely.geometry import Point as ShapelyPoint
                                 _tol = 1e-6
@@ -4006,6 +4779,8 @@ def _draw_lines_and_save(
                                 anchor_candidates = [c for c in anchor_candidates if _strictly_inside(c)]
                             except Exception:
                                 pass
+                            if not anchor_candidates:
+                                anchor_candidates = anchor_candidates_all
                         if not anchor_candidates:
                             continue
                         best_d2 = 1e30
@@ -4015,11 +4790,79 @@ def _draw_lines_and_save(
                                 best_d2 = d2
                                 best_ax, best_ay = q[0], q[1]
                 ka = (round(best_ax, 2), round(best_ay, 2))
+                # Anchor gri valid doar pe baza overhang (magenta), nu în interior.
+                if not _near_base_overhang(best_ax, best_ay):
+                    continue
                 if not _anchor_near(best_ax, best_ay):
                     drawn_anchors.add(ka)
                     drawn_anchor_positions.append((best_ax, best_ay))
                     ax.scatter([best_ax], [best_ay], c="gray", s=50, zorder=14, edgecolors="black", linewidths=1)
                 ax.plot([p[0], best_ax], [p[1], best_ay], color="gray", linewidth=_lw, linestyle=":", alpha=0.8, zorder=12)
+
+            # Ancore explicite la intersecția dintre dreptunghiuri lipite:
+            # dacă două secțiuni au muchie comună, punem gray la AMBELE capete ale muchiei comune
+            # (doar dacă punctele sunt pe baza overhang / magenta).
+            try:
+                if sections and len(sections) >= 2:
+                    from shapely.geometry import Polygon as ShapelyPolygon
+                    sec_polys: List[Any] = []
+                    for sec in sections:
+                        br = sec.get("bounding_rect") or []
+                        if len(br) < 3:
+                            sec_polys.append(None)
+                            continue
+                        try:
+                            poly = ShapelyPolygon([(float(p[0]), float(p[1])) for p in br]).buffer(0)
+                            if poly is None or getattr(poly, "is_empty", True):
+                                sec_polys.append(None)
+                            else:
+                                sec_polys.append(poly)
+                        except Exception:
+                            sec_polys.append(None)
+                    for i in range(len(sec_polys)):
+                        pi = sec_polys[i]
+                        if pi is None:
+                            continue
+                        for j in range(i + 1, len(sec_polys)):
+                            pj = sec_polys[j]
+                            if pj is None:
+                                continue
+                            inter = pi.intersection(pj)
+                            if inter is None or getattr(inter, "is_empty", True):
+                                continue
+                            geoms = list(getattr(inter, "geoms", None) or [inter])
+                            for g in geoms:
+                                coords = list(getattr(g, "coords", []) or [])
+                                if len(coords) < 2:
+                                    continue
+                                # capetele muchiei comune
+                                cand = [
+                                    (float(coords[0][0]), float(coords[0][1])),
+                                    (float(coords[-1][0]), float(coords[-1][1])),
+                                ]
+                                for axc, ayc in cand:
+                                    if not _near_base_overhang(axc, ayc):
+                                        continue
+                                    if _anchor_near(axc, ayc):
+                                        continue
+                                    ka = (round(axc, 2), round(ayc, 2))
+                                    drawn_anchors.add(ka)
+                                    drawn_anchor_positions.append((axc, ayc))
+                                    ax.scatter([axc], [ayc], c="gray", s=50, zorder=14, edgecolors="black", linewidths=1)
+            except Exception:
+                pass
+
+            # Regula: darkblue doar dacă are gray sursă; per gray păstrăm doar cea mai apropiată.
+            if overhang_ridge_pts:
+                filtered_ridge = _filter_ridge_pts_by_nearest_gray(
+                    [(float(p[0]), float(p[1])) for p in overhang_ridge_pts],
+                    ridge_anchor_positions,
+                )
+                overhang_ridge_pts = filtered_ridge
+                if overhang_ridge_pts:
+                    uniq = list(dict.fromkeys([(round(p[0], 2), round(p[1], 2)) for p in overhang_ridge_pts]))
+                    ax.scatter([p[0] for p in uniq], [p[1] for p in uniq], c="darkblue", s=80, zorder=15, edgecolors="black", linewidths=1)
+            lines_gray_anchor_pts = list(dict.fromkeys([(round(p[0], 2), round(p[1], 2)) for p in drawn_anchor_positions]))
 
     if segments_brown:
         for seg in segments_brown:
@@ -4064,18 +4907,94 @@ def _draw_lines_and_save(
                 s = _offset_seg(seg, _off * 10)
                 ax.plot([s[0][0], s[1][0]], [s[0][1], s[1][1]], color="deepskyblue", linewidth=_lw, alpha=_alpha, zorder=6)
 
-    # Buline galbene la mijlocul fiecărui ridge (original, netrimat – pentru 4.5_w)
-    src = ridge_midpoints_from if ridge_midpoints_from is not None else segments_ridge
-    ridge_midpoints: List[Tuple[float, float]] = []
-    for seg in src:
-        if len(seg) >= 2:
-            mx = (seg[0][0] + seg[1][0]) / 2.0
-            my = (seg[0][1] + seg[1][1]) / 2.0
-            ridge_midpoints.append((mx, my))
+    # Buline galbene la mijloc ridge:
+    # - 4_w: centrul fiecărui dreptunghi (nu poate ieși în exteriorul secțiunii)
+    # - rest: mijlocul segmentelor ridge folosite la desen
+    if roof_type == "4_w" and sections:
+        ridge_midpoints = _section_centers(sections)
+    else:
+        src = ridge_midpoints_from if ridge_midpoints_from is not None else segments_ridge
+        ridge_midpoints: List[Tuple[float, float]] = []
+        for seg in src:
+            if len(seg) >= 2:
+                mx = (seg[0][0] + seg[1][0]) / 2.0
+                my = (seg[0][1] + seg[1][1]) / 2.0
+                ridge_midpoints.append((mx, my))
     if ridge_midpoints:
         xs = [p[0] for p in ridge_midpoints]
         ys = [p[1] for p in ridge_midpoints]
         ax.scatter(xs, ys, c="yellow", s=80, zorder=15, edgecolors="black", linewidths=1)
+    # 2_w: din fiecare mijloc de ridge trasăm linii mov spre colțurile gri relevante,
+    # preferat doar în secțiunea curentă (fallback: max 4 cele mai apropiate din componentă).
+    if roof_type == "2_w" and ridge_midpoints and lines_gray_anchor_pts and sections:
+        comps = _section_connected_components(sections)
+        if not comps:
+            comps = [[i] for i in range(len(sections))]
+
+        sec_boxes: List[Tuple[float, float, float, float]] = []
+        for sec in sections:
+            br = sec.get("bounding_rect") or []
+            if len(br) < 3:
+                sec_boxes.append((0.0, 0.0, -1.0, -1.0))
+                continue
+            xsb = [float(p[0]) for p in br]
+            ysb = [float(p[1]) for p in br]
+            sec_boxes.append((min(xsb), min(ysb), max(xsb), max(ysb)))
+
+        sec_to_comp: Dict[int, int] = {}
+        for ci, comp in enumerate(comps):
+            for si in comp:
+                sec_to_comp[si] = ci
+
+        def _point_comp(px: float, py: float, tol: float = 2.0) -> Optional[int]:
+            for si, (mnx, mny, mxx, mxy) in enumerate(sec_boxes):
+                if mxx < mnx or mxy < mny:
+                    continue
+                if (mnx - tol) <= px <= (mxx + tol) and (mny - tol) <= py <= (mxy + tol):
+                    return sec_to_comp.get(si)
+            return None
+
+        gray_by_comp: Dict[int, List[Tuple[float, float]]] = {}
+        for g in lines_gray_anchor_pts:
+            gx, gy = float(g[0]), float(g[1])
+            ci = _point_comp(gx, gy, tol=3.0)
+            if ci is None:
+                continue
+            gray_by_comp.setdefault(ci, []).append((gx, gy))
+
+        def _closest_section_idx(px: float, py: float) -> Optional[int]:
+            best_i = None
+            best_d2 = 1e30
+            for si, (mnx, mny, mxx, mxy) in enumerate(sec_boxes):
+                if mxx < mnx or mxy < mny:
+                    continue
+                cx = (mnx + mxx) / 2.0
+                cy = (mny + mxy) / 2.0
+                d2 = (px - cx) ** 2 + (py - cy) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_i = si
+            return best_i
+
+        for mp in ridge_midpoints:
+            mx, my = float(mp[0]), float(mp[1])
+            ci = _point_comp(mx, my, tol=3.0)
+            if ci is None:
+                continue
+            si = _closest_section_idx(mx, my)
+            cand = []
+            if si is not None:
+                mnx, mny, mxx, mxy = sec_boxes[si]
+                # doar punctele gri de pe dreptunghiul secțiunii curente
+                for gx, gy in gray_by_comp.get(ci, []):
+                    if (mnx - 2.0) <= gx <= (mxx + 2.0) and (mny - 2.0) <= gy <= (mxy + 2.0):
+                        cand.append((gx, gy))
+            if not cand:
+                # fallback: limităm fan-ul la 4 puncte cele mai apropiate
+                allg = gray_by_comp.get(ci, [])
+                cand = sorted(allg, key=lambda g: (mx - g[0]) ** 2 + (my - g[1]) ** 2)[:4]
+            for gx, gy in cand:
+                ax.plot([mx, gx], [my, gy], color="#FF66CC", linewidth=_lw, alpha=0.9, zorder=11)
 
     if ridge_pink_points:
         px = [p[0] for p in ridge_pink_points]
@@ -4151,9 +5070,30 @@ def _draw_lines_and_save(
     try:
         plt.savefig(str(output_path), dpi=150, bbox_inches="tight")
         plt.close()
+        if return_points:
+            corners = list(dict.fromkeys([(round(p[0], 2), round(p[1], 2)) for p in overhang_corner_pts]))
+            ridges = list(dict.fromkeys([(round(p[0], 2), round(p[1], 2)) for p in overhang_ridge_pts]))
+            pairs = []
+            seen_pairs = set()
+            for rp, gp in lines_ridge_anchor_pairs:
+                rk = (round(float(rp[0]), 2), round(float(rp[1]), 2))
+                gk = (round(float(gp[0]), 2), round(float(gp[1]), 2))
+                key = (rk, gk)
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+                pairs.append([[float(rk[0]), float(rk[1])], [float(gk[0]), float(gk[1])]])
+            return {
+                "overhang_corners": [(float(p[0]), float(p[1])) for p in corners],
+                "overhang_ridge_pts": [(float(p[0]), float(p[1])) for p in ridges],
+                "gray_anchor_pts": [(float(p[0]), float(p[1])) for p in lines_gray_anchor_pts],
+                "ridge_anchor_pairs": pairs,
+            }
         return True
     except Exception:
         plt.close()
+        if return_points:
+            return None
         return False
 
 
@@ -4204,9 +5144,8 @@ def _faces_from_segments(
 
     secs = _sections_for_1w_shed(sections) if roof_type in ("0_w", "1_w") else sections
     corner_lines = None
-    if roof_type not in ("0_w", "1_w") and _has_ridge_intersection(sections):
-        from roof_calc.overhang import ridge_intersection_corner_lines
-        corner_lines = ridge_intersection_corner_lines(sections, per_section=False)
+    if roof_type not in ("0_w", "1_w"):
+        corner_lines = _ridge_corner_lines_by_component(sections)
 
     try:
         return get_faces_3d_from_segments(
@@ -4285,6 +5224,152 @@ def _generate_frame_html(subdir: Path, wall_height: float = 300.0) -> None:
     markers_data = payload.get("markers") or {}
     has_segments = bool(segs_data)
     roof_type_frame = subdir.name
+    faces_points = markers_data.get("faces_points") or []
+    ridge_anchor_pairs = markers_data.get("ridge_anchor_pairs") or []
+
+    # Render "cu fețe" curat pentru TOATE tipurile:
+    # doar fețe + punctele din faces.png + pereți (fără segmente auxiliare/markeri extra).
+    try:
+        fig = go.Figure()
+        poly_idx = 0
+        canonical_vertices: List[Tuple[float, float, float]] = []
+        for f in faces:
+            vs = f.get("vertices_3d") or []
+            if len(vs) < 3:
+                continue
+            for v in vs:
+                if len(v) >= 3:
+                    canonical_vertices.append((float(v[0]), float(v[1]), float(v[2])))
+            poly_idx += 1
+            xs = [float(v[0]) for v in vs]
+            ys = [float(v[1]) for v in vs]
+            zs = [float(v[2]) for v in vs]
+            i_arr, j_arr, k_arr = [], [], []
+            for t in range(1, len(vs) - 1):
+                i_arr.append(0)
+                j_arr.append(t)
+                k_arr.append(t + 1)
+            fig.add_trace(go.Mesh3d(
+                x=xs, y=ys, z=zs, i=i_arr, j=j_arr, k=k_arr,
+                opacity=0.6, color="rgba(120,160,220,0.6)", showlegend=False,
+            ))
+            fig.add_trace(go.Scatter3d(
+                x=[sum(xs) / len(xs)], y=[sum(ys) / len(ys)], z=[sum(zs) / len(zs)],
+                mode="text", text=[str(poly_idx)],
+                textfont=dict(size=14, color="black"), showlegend=False, hoverinfo="skip",
+            ))
+
+        # Pereți
+        wall_segs_2d: List[List[List[float]]] = []
+        if floor_path:
+            mask = cv2.imread(str(floor_path), cv2.IMREAD_GRAYSCALE)
+            if mask is not None:
+                wall_segs_2d = _get_contour_segments(mask)
+        if not wall_segs_2d:
+            for seg in (segs_data.get("contour") or []):
+                if not seg or len(seg) < 2:
+                    continue
+                pts = seg if isinstance(seg[0], (list, tuple)) else []
+                if len(pts) < 2:
+                    continue
+                p1, p2 = pts[0], pts[1]
+                wall_segs_2d.append([[float(p1[0]), float(p1[1])], [float(p2[0]), float(p2[1])]])
+        if wall_segs_2d:
+            lx_w, ly_w, lz_w = [], [], []
+            uniq_pts_w: set = set()
+            for seg in wall_segs_2d:
+                if len(seg) < 2:
+                    continue
+                x1, y1 = float(seg[0][0]), float(seg[0][1])
+                x2, y2 = float(seg[1][0]), float(seg[1][1])
+                lx_w.extend([x1, x2, None]); ly_w.extend([y1, y2, None]); lz_w.extend([0.0, 0.0, None])
+                lx_w.extend([x1, x2, None]); ly_w.extend([y1, y2, None]); lz_w.extend([wh, wh, None])
+                uniq_pts_w.add((round(x1, 2), round(y1, 2)))
+                uniq_pts_w.add((round(x2, 2), round(y2, 2)))
+            for xk, yk in uniq_pts_w:
+                lx_w.extend([xk, xk, None]); ly_w.extend([yk, yk, None]); lz_w.extend([0.0, wh, None])
+            fig.add_trace(go.Scatter3d(
+                x=lx_w, y=ly_w, z=lz_w, mode="lines",
+                line=dict(color="#3498DB", width=2), name="Contur pereți", legendgroup="walls",
+            ))
+
+        # Puncte din faces.png (lightblue/darkblue/gray), cu Z corect prin snap la vârfuri de fețe.
+        def _z_from_faces_points(px: float, py: float) -> float:
+            best_d2 = 1e30
+            best_z = None
+            for vx, vy, vz in canonical_vertices:
+                d2 = (px - vx) ** 2 + (py - vy) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_z = vz
+            if best_z is not None and best_d2 <= 16.0:
+                return best_z
+            return _z_roof_at(faces, px, py, wh, tol=40.0)
+
+        if faces_points:
+            kind_to_color = {"lightblue": "lightblue", "darkblue": "darkblue", "gray": "gray", "yellow": "yellow"}
+            dark_z_by_pt: Dict[Tuple[float, float], float] = {}
+            for p in faces_points:
+                if str(p.get("kind") or "") != "darkblue":
+                    continue
+                try:
+                    dx = float(p.get("x")); dy = float(p.get("y"))
+                except Exception:
+                    continue
+                dark_z_by_pt[(round(dx, 2), round(dy, 2))] = _z_from_faces_points(dx, dy)
+            gray_to_dark_z: Dict[Tuple[float, float], float] = {}
+            for pr in ridge_anchor_pairs:
+                if not isinstance(pr, (list, tuple)) or len(pr) < 2:
+                    continue
+                try:
+                    rp = pr[0]; gp = pr[1]
+                    rk = (round(float(rp[0]), 2), round(float(rp[1]), 2))
+                    gk = (round(float(gp[0]), 2), round(float(gp[1]), 2))
+                except Exception:
+                    continue
+                dz = dark_z_by_pt.get(rk)
+                if dz is not None:
+                    gray_to_dark_z[gk] = float(dz)
+            ridge_like_z = None
+            if dark_z_by_pt:
+                ridge_like_z = sum(float(v) for v in dark_z_by_pt.values()) / float(len(dark_z_by_pt))
+            for kind in ("lightblue", "darkblue", "gray", "yellow"):
+                pts = [p for p in faces_points if str(p.get("kind") or "") == kind]
+                if not pts:
+                    continue
+                xs, ys = [], []
+                for p in pts:
+                    try:
+                        xs.append(float(p.get("x"))); ys.append(float(p.get("y")))
+                    except Exception:
+                        continue
+                if not xs:
+                    continue
+                if kind == "gray":
+                    zs = []
+                    for x, y in zip(xs, ys):
+                        k = (round(float(x), 2), round(float(y), 2))
+                        zs.append(gray_to_dark_z.get(k, _z_from_faces_points(float(x), float(y))))
+                elif kind == "yellow" and ridge_like_z is not None:
+                    zs = [float(ridge_like_z) for _ in xs]
+                else:
+                    zs = [_z_from_faces_points(float(x), float(y)) for x, y in zip(xs, ys)]
+                fig.add_trace(go.Scatter3d(
+                    x=xs, y=ys, z=zs, mode="markers",
+                    marker=dict(size=7, color=kind_to_color[kind], symbol="circle", line=dict(width=1, color="black")),
+                    name=f"Puncte {kind}", legendgroup=f"faces_points_{kind}",
+                ))
+
+        fig.update_layout(
+            title=f"3D – {subdir.name}",
+            scene=dict(aspectmode="data", xaxis=dict(title="x"), yaxis=dict(title="y"), zaxis=dict(title="z")),
+            margin=dict(l=0, r=0, b=0, t=40),
+            showlegend=True,
+        )
+        fig.write_html(str(subdir / "frame.html"), include_plotlyjs="cdn", full_html=True)
+        return
+    except Exception:
+        pass
 
     def _seg_to_plotly(segs_2d: List[Any], z_fn, endpoints_only: bool = False) -> Tuple[List[float], List[float], List[float]]:
         lx, ly, lz = [], [], []
@@ -4762,6 +5847,7 @@ def generate_entire_frame_html(
         return
 
     floor_payloads: List[Tuple[int, Dict[str, Any], str, str]] = []
+    selected_single_roof_type: Optional[str] = None
     if floor_roof_types:
         for floor_dir in floor_dirs:
             fidx = int(floor_dir.name.split("_")[1]) if floor_dir.name.split("_")[1].isdigit() else 0
@@ -4775,6 +5861,13 @@ def generate_entire_frame_html(
                     floor_payloads.append((fidx, payload, str(ff_path.parent), rt))
                 except Exception:
                     pass
+        # Dacă toate etajele selectate folosesc același tip, păstrăm și path-ul clasic entire/<type>/...
+        try:
+            uniq_rt = sorted(set([rt for _, _, _, rt in floor_payloads]))
+            if len(uniq_rt) == 1:
+                selected_single_roof_type = uniq_rt[0]
+        except Exception:
+            selected_single_roof_type = None
         out_subdir = "mixed"
     else:
         for floor_dir in floor_dirs:
@@ -5313,6 +6406,8 @@ def generate_entire_frame_html(
         showlegend=True,
     )
     fig.write_html(str(entire_dir / "frame.html"), include_plotlyjs="cdn", full_html=True)
+    # Randarea "cu fețe" (filled) trebuie să conțină doar fețe + punctele din faces.png.
+    fig_filled = go.Figure()
 
     seed = hash(str(floor_roof_types or roof_type)) % (2**32)
     rng = random.Random(seed)
@@ -5322,6 +6417,48 @@ def generate_entire_frame_html(
         dx_off = float(off.get("dx", 0))
         dy_off = float(off.get("dy", 0))
         fwh = float(payload.get("wall_height", wh))
+        # În filled păstrăm și pereții (cerință explicită): contur la z=0 și z=wall_height + verticale.
+        wall_segs_2d_filled: List[List[List[float]]] = []
+        floor_path_wall = payload.get("floor_path")
+        if floor_path_wall:
+            mask_wall = cv2.imread(str(floor_path_wall), cv2.IMREAD_GRAYSCALE)
+            if mask_wall is not None:
+                wall_segs_2d_filled = _get_contour_segments(mask_wall)
+        if not wall_segs_2d_filled:
+            contour_fallback = (payload.get("segments") or {}).get("contour") or []
+            for seg in contour_fallback:
+                if not seg or len(seg) < 2:
+                    continue
+                pts = seg if isinstance(seg[0], (list, tuple)) else []
+                if len(pts) < 2:
+                    continue
+                p1, p2 = pts[0], pts[1]
+                wall_segs_2d_filled.append([[float(p1[0]), float(p1[1])], [float(p2[0]), float(p2[1])]])
+        if wall_segs_2d_filled:
+            lx_w, ly_w, lz_w = [], [], []
+            uniq_pts_w: set = set()
+            for seg in wall_segs_2d_filled:
+                if len(seg) < 2:
+                    continue
+                x1, y1 = float(seg[0][0]) + dx_off, float(seg[0][1]) + dy_off
+                x2, y2 = float(seg[1][0]) + dx_off, float(seg[1][1]) + dy_off
+                lx_w.extend([x1, x2, None])
+                ly_w.extend([y1, y2, None])
+                lz_w.extend([z_off, z_off, None])
+                lx_w.extend([x1, x2, None])
+                ly_w.extend([y1, y2, None])
+                lz_w.extend([z_off + fwh, z_off + fwh, None])
+                uniq_pts_w.add((round(x1, 2), round(y1, 2)))
+                uniq_pts_w.add((round(x2, 2), round(y2, 2)))
+            for (xk, yk) in uniq_pts_w:
+                lx_w.extend([xk, xk, None])
+                ly_w.extend([yk, yk, None])
+                lz_w.extend([z_off, z_off + fwh, None])
+            fig_filled.add_trace(go.Scatter3d(
+                x=lx_w, y=ly_w, z=lz_w, mode="lines",
+                line=dict(color="#3498DB", width=2),
+                name=f"Contur pereți (etaj {floor_idx})", legendgroup=f"walls_{floor_idx}",
+            ))
         faces = payload.get("faces") or []
         ridge_pts: List[Tuple[float, float]] = []
         for seg in (payload.get("segments") or {}).get("ridge") or []:
@@ -5500,6 +6637,28 @@ def generate_entire_frame_html(
         elif polygons_2d:
             for poly in polygons_2d:
                 poly_and_zs.append((poly, None))
+        # Canonical vertices din fețe pentru poziționare corectă a bulinelor în spațiu.
+        canonical_face_vertices: List[Tuple[float, float, float]] = []
+        for f in faces_list:
+            vs = f.get("vertices_3d") or []
+            for v in vs:
+                if len(v) >= 3:
+                    canonical_face_vertices.append((float(v[0]), float(v[1]), float(v[2])))
+
+        def _z_from_faces_points(px: float, py: float) -> float:
+            # 1) Snap pe cel mai apropiat vârf de față (preferat: exact ce e în faces.png).
+            best_d2 = 1e30
+            best_z = None
+            for vx, vy, vz in canonical_face_vertices:
+                d2 = (px - vx) ** 2 + (py - vy) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_z = vz
+            if best_z is not None and best_d2 <= 16.0:  # 4px
+                return best_z + z_off
+            # 2) fallback: interpolare pe suprafața fețelor
+            return _z_roof_at(faces_list, px, py, fwh, z_off, tol=40.0)
+
         faces_for_unfold: List[Dict[str, Any]] = []
         poly_idx = 0
         for poly, zs_from_face in poly_and_zs:
@@ -5548,19 +6707,76 @@ def generate_entire_frame_html(
                 k_arr.append(t + 1)
             r, g, b = rng.random(), rng.random(), rng.random()
             color_hex = f"rgba({int(r*255)},{int(g*255)},{int(b*255)},0.6)"
-            fig.add_trace(go.Mesh3d(
+            fig_filled.add_trace(go.Mesh3d(
                 x=xs, y=ys, z=zs, i=i_arr, j=j_arr, k=k_arr,
                 color=color_hex, opacity=0.6, showlegend=False,
             ))
             cx = sum(xs) / len(xs)
             cy = sum(ys) / len(ys)
             cz = sum(zs) / len(zs)
-            fig.add_trace(go.Scatter3d(
+            fig_filled.add_trace(go.Scatter3d(
                 x=[cx], y=[cy], z=[cz],
                 mode="text", text=[str(poly_idx)],
                 textfont=dict(size=14, color="black"),
                 showlegend=False, hoverinfo="skip",
             ))
+        faces_points = ((payload.get("markers") or {}).get("faces_points") or [])
+        ridge_anchor_pairs_floor = ((payload.get("markers") or {}).get("ridge_anchor_pairs") or [])
+        if faces_points:
+            kind_to_color = {"lightblue": "lightblue", "darkblue": "darkblue", "gray": "gray", "yellow": "yellow"}
+            dark_z_by_pt_floor: Dict[Tuple[float, float], float] = {}
+            for p in faces_points:
+                if str(p.get("kind") or "") != "darkblue":
+                    continue
+                try:
+                    dxp = float(p.get("x")); dyp = float(p.get("y"))
+                except Exception:
+                    continue
+                dark_z_by_pt_floor[(round(dxp, 2), round(dyp, 2))] = _z_from_faces_points(dxp, dyp)
+            gray_to_dark_z_floor: Dict[Tuple[float, float], float] = {}
+            for pr in ridge_anchor_pairs_floor:
+                if not isinstance(pr, (list, tuple)) or len(pr) < 2:
+                    continue
+                try:
+                    rp = pr[0]; gp = pr[1]
+                    rk = (round(float(rp[0]), 2), round(float(rp[1]), 2))
+                    gk = (round(float(gp[0]), 2), round(float(gp[1]), 2))
+                except Exception:
+                    continue
+                dz = dark_z_by_pt_floor.get(rk)
+                if dz is not None:
+                    gray_to_dark_z_floor[gk] = float(dz)
+            ridge_like_z_floor = None
+            if dark_z_by_pt_floor:
+                ridge_like_z_floor = sum(float(v) for v in dark_z_by_pt_floor.values()) / float(len(dark_z_by_pt_floor))
+            for kind in ("lightblue", "darkblue", "gray", "yellow"):
+                pts = [p for p in faces_points if str(p.get("kind") or "") == kind]
+                if not pts:
+                    continue
+                xs = []
+                ys = []
+                for p in pts:
+                    try:
+                        xs.append(float(p.get("x")) + dx_off)
+                        ys.append(float(p.get("y")) + dy_off)
+                    except Exception:
+                        continue
+                if not xs:
+                    continue
+                if kind == "gray":
+                    zs = []
+                    for x, y in zip(xs, ys):
+                        k_local = (round(float(x - dx_off), 2), round(float(y - dy_off), 2))
+                        zs.append(gray_to_dark_z_floor.get(k_local, _z_from_faces_points(float(x - dx_off), float(y - dy_off))))
+                elif kind == "yellow" and ridge_like_z_floor is not None:
+                    zs = [float(ridge_like_z_floor) for _ in xs]
+                else:
+                    zs = [_z_from_faces_points(float(x - dx_off), float(y - dy_off)) for x, y in zip(xs, ys)]
+                fig_filled.add_trace(go.Scatter3d(
+                    x=xs, y=ys, z=zs, mode="markers",
+                    marker=dict(size=7, color=kind_to_color[kind], symbol="circle", line=dict(width=1, color="black")),
+                    name=f"Puncte {kind} (etaj {floor_idx})", legendgroup=f"faces_points_{kind}_{floor_idx}",
+                ))
         if faces_for_unfold:
             floor_path_filled = payload.get("floor_path")
             plan_h, plan_w = 0, 0
@@ -5583,12 +6799,25 @@ def generate_entire_frame_html(
                         generate_unfold_masks_for_roof_types(overhang_faces_for_unfold, plan_h, plan_w, unfold_overhang_dir)
                 except Exception:
                     pass
-    fig.update_layout(title=f"3D – Casa întreagă ({title_roof}) – umplut")
-    fig.write_html(str(entire_dir / "filled.html"), include_plotlyjs="cdn", full_html=True)
+    fig_filled.update_layout(title=f"3D – Casa întreagă ({title_roof}) – umplut")
+    fig_filled.write_html(str(entire_dir / "filled.html"), include_plotlyjs="cdn", full_html=True)
     try:
-        fig.write_image(str(entire_dir / "filled.png"), width=900, height=700, scale=2)
+        fig_filled.write_image(str(entire_dir / "filled.png"), width=900, height=700, scale=2)
     except Exception:
         pass
+    # Compatibilitate path: unele fluxuri caută direct entire/<roof_type>/filled.html chiar când output-ul e "mixed".
+    if out_subdir == "mixed" and selected_single_roof_type in ("0_w", "1_w", "2_w", "4_w", "4.5_w"):
+        try:
+            compat_dir = roof_types_dir / "entire" / str(selected_single_roof_type)
+            compat_dir.mkdir(parents=True, exist_ok=True)
+            fig.write_html(str(compat_dir / "frame.html"), include_plotlyjs="cdn", full_html=True)
+            fig_filled.write_html(str(compat_dir / "filled.html"), include_plotlyjs="cdn", full_html=True)
+            try:
+                fig_filled.write_image(str(compat_dir / "filled.png"), width=900, height=700, scale=2)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
 
 def _mask_area_and_contour_px(mask: np.ndarray) -> Tuple[float, float]:
@@ -5984,12 +7213,22 @@ def generate_roof_type_outputs(
 
         use_ridge_trimmed = roof_type in ("4.5_w", "4_w") and config["ridge"]
         seg_pyramid_short = (
-            _get_pyramid_diagonal_segments(sections, upper_floor_sections, shorten_to_midpoint=True)
+            _get_pyramid_diagonal_segments(
+                sections,
+                upper_floor_sections,
+                shorten_to_midpoint=True,
+                use_extended_ridge=(roof_type == "4.5_w"),
+            )
             if config["pyramid"] and use_ridge_trimmed
             else []
         )
         seg_pyramid = (
-            _get_pyramid_diagonal_segments(sections, upper_floor_sections, shorten_to_midpoint=(roof_type == "4.5_w"))
+            _get_pyramid_diagonal_segments(
+                sections,
+                upper_floor_sections,
+                shorten_to_midpoint=(roof_type == "4.5_w"),
+                use_extended_ridge=(roof_type == "4.5_w"),
+            )
             if config["pyramid"]
             else []
         )
@@ -5999,6 +7238,8 @@ def generate_roof_type_outputs(
             if use_ridge_trimmed and seg_pyramid_short
             else (ridge_segs if config["ridge"] else [])
         )
+        if roof_type == "2_w" and config["ridge"]:
+            seg_ridge = _get_ridge_segments_per_rectangle(sections)
         seg_magenta = magenta_segs if config["magenta"] else []
         if roof_type == "4.5_w":
             seg_magenta = []  # 4.5_w: fără linii mov
@@ -6091,7 +7332,7 @@ def generate_roof_type_outputs(
             contour_pink_recon = _process_segs_reconstruct(contour_segs_45w_pink)
             # Pentru 3D: diagonale întregi (corner→ridge), un singur segment – nu schimbare de direcție la jumătate
             seg_pyramid_full = _get_pyramid_diagonal_segments(
-                sections, upper_floor_sections, shorten_to_midpoint=False
+                sections, upper_floor_sections, shorten_to_midpoint=False, use_extended_ridge=True
             ) if config["pyramid"] else []
             seg_pyramid_3d = list(seg_pyramid_full)
             seg_pyramid = list(seg_pyramid) + contour_pink_recon
@@ -6146,7 +7387,7 @@ def generate_roof_type_outputs(
                             sections_not_covered_for_draw, upper_floor_sections
                         ) or []
                         seg_pyramid_draw = _get_pyramid_diagonal_segments(
-                            sections_not_covered_for_draw, upper_floor_sections, shorten_to_midpoint=True
+                            sections_not_covered_for_draw, upper_floor_sections, shorten_to_midpoint=True, use_extended_ridge=True
                         ) or []
                         seg_contour_draw = (list(seg_45w_draw) + list(seg_sep_draw)) if seg_45w_draw else []
                         seg_base_full_45w = list(seg_contour_draw) + list(seg_orange_draw) + list(seg_pyramid_draw)
@@ -6157,19 +7398,30 @@ def generate_roof_type_outputs(
                 seg_for_overhang = list(seg_contour) + list(seg_pyramid)
             else:
                 seg_for_overhang = seg_contour
-            # 2_w: overhang 1 m per dreptunghi (fiecare secțiune în parte) → mai multe noduri pentru L
+            # 2_w: overhang 1 m per componentă conectată (nu per dreptunghi),
+            # ca să obținem inel exterior corect pentru forme L/T fără goluri pe laturi.
             if roof_type == "2_w" and sections and mpp_for_overhang and mpp_for_overhang > 0:
                 seg_overhang = []
                 seg_for_overhang_draw = []
-                for sec in sections:
-                    if upper_rect_segs and _section_or_comp_covered([sec], upper_rect_segs, upper_floor_sections or []):
+                comps = _section_connected_components(sections)
+                if not comps:
+                    comps = [[i] for i in range(len(sections))]
+                for comp in comps:
+                    comp_secs = [sections[i] for i in comp if 0 <= i < len(sections)]
+                    if not comp_secs:
                         continue
-                    rect_segs = _section_rect_segments(sec)
-                    if not rect_segs:
+                    if upper_rect_segs and _section_or_comp_covered(comp_secs, upper_rect_segs, upper_floor_sections or []):
                         continue
-                    seg_for_overhang_draw.extend(rect_segs)
+                    comp_contour = _get_contour_segments_from_sections(comp_secs, (h, w))
+                    if not comp_contour:
+                        comp_contour = []
+                        for sec in comp_secs:
+                            comp_contour.extend(_section_rect_segments(sec))
+                    if not comp_contour:
+                        continue
+                    seg_for_overhang_draw.extend(comp_contour)
                     oh = _overhang_segments_from_contour(
-                        rect_segs, mpp_for_overhang, overhang_meters=1.0,
+                        comp_contour, mpp_for_overhang, overhang_meters=1.0,
                     )
                     seg_overhang.extend(oh)
             else:
@@ -6214,6 +7466,10 @@ def generate_roof_type_outputs(
                 seg_for_overhang_draw = _filter_overhang_segments_not_on_covered_sections(
                     seg_for_overhang_draw, sections, upper_rect_segs, upper_floor_sections
                 )
+            # Eliminăm segmentele de overhang aflate în interiorul unui overhang mai mare.
+            # În caz de suprapuneri, păstrăm doar frontiera exterioară utilă pentru generarea fețelor.
+            if seg_overhang:
+                seg_overhang = _remove_interior_overhang_segments(seg_overhang)
             # 2_w: segmente overhang cu bulină albastră închis la mijloc → mov închis
             seg_overhang_ridge: Optional[List[List[List[float]]]] = None
             if roof_type == "2_w" and seg_overhang and seg_ridge:
@@ -6223,7 +7479,7 @@ def generate_roof_type_outputs(
                 seg_overhang_ridge = _overhang_segments_with_ridge_pt(
                     seg_overhang, overhang_ridge_pts_2w, tol=5.0,
                 )
-        _draw_lines_and_save(
+        lines_points = _draw_lines_and_save(
             img,
             seg_ridge,
             seg_contour,
@@ -6234,7 +7490,7 @@ def generate_roof_type_outputs(
             roof_type,
             subdir / "lines.png",
             segments_orange=seg_orange,
-            ridge_midpoints_from=ridge_segs if roof_type in ("4.5_w", "4_w") and use_ridge_trimmed else None,
+            ridge_midpoints_from=ridge_segs if roof_type == "4.5_w" and use_ridge_trimmed else None,
             ridge_pink_points=ridge_pink,
             brown_endpoint_markers=brown_endpoint_markers,
             segments_brown=seg_brown,
@@ -6243,7 +7499,21 @@ def generate_roof_type_outputs(
             segments_overhang_inner=seg_for_overhang_draw,
             segments_overhang_ridge=seg_overhang_ridge if roof_type == "2_w" else None,
             sections=sections,
+            return_points=True,
         )
+
+        # Mijloace ridge exact ca în lines.png (pentru faces.png + markeri 3D)
+        if roof_type == "4_w":
+            ridge_midpoints_faces = _section_centers(sections or [])
+        else:
+            ridge_src_for_mid = ridge_segs if roof_type == "4.5_w" and use_ridge_trimmed else seg_ridge
+            ridge_midpoints_faces: List[Tuple[float, float]] = []
+            for _seg_m in (ridge_src_for_mid or []):
+                if len(_seg_m) < 2:
+                    continue
+                _mx = (float(_seg_m[0][0]) + float(_seg_m[1][0])) / 2.0
+                _my = (float(_seg_m[0][1]) + float(_seg_m[1][1])) / 2.0
+                ridge_midpoints_faces.append((_mx, _my))
 
         all_seg_lists = [seg_ridge, seg_contour, seg_magenta, seg_blue, seg_pyramid]
         if roof_type in ("0_w", "1_w"):
@@ -6259,6 +7529,7 @@ def generate_roof_type_outputs(
             exclude_interior_of=upper_rect_segs if upper_rect_segs else None,
         )
         num_roof_polygons = len(polygons_2d)  # fețe acoperiș (fără banda overhang) – pentru unfold_roof vs unfold_overhang
+        faces_used_points: List[Dict[str, Any]] = []
         # Fețe overhang: zone între cyan (outer) și magenta (inner), împărțite de liniile gri punctat (anchor).
         # LOGICĂ: polygonize(outer_lines + inner_lines + anchor_lines) → poligoane cu centroid ÎN BANDĂ
         #         = în outer_poly ȘI NU în inner_poly. NU folosim band_geom pentru filtru (prea restrictiv).
@@ -6276,14 +7547,11 @@ def generate_roof_type_outputs(
                 if not overhang_lines:
                     raise ValueError("no overhang lines")
 
-                # outer_poly = poligonul overhang exterior (cyan)
+                # outer_poly = uniunea tuturor poligoanelor overhang exterior (cyan)
                 over_polys, _, _, _ = polygonize_full(overhang_lines)
                 over_geoms = list(getattr(over_polys, "geoms", None) or [over_polys])
-                outer_poly = max(
-                    [g for g in over_geoms if g is not None and not getattr(g, "is_empty", True)],
-                    key=lambda g: getattr(g, "area", 0) or 0,
-                    default=None,
-                )
+                valid_over = [g for g in over_geoms if g is not None and not getattr(g, "is_empty", True)]
+                outer_poly = unary_union(valid_over) if valid_over else None
                 if outer_poly is None or getattr(outer_poly, "is_empty", True):
                     raise ValueError("outer_poly empty")
 
@@ -6317,6 +7585,88 @@ def generate_roof_type_outputs(
                 if inner_poly is None or getattr(inner_poly, "is_empty", True):
                     raise ValueError("inner_poly empty")
 
+                # band_target: masca albastră din lines.png (outer overhang minus amprenta albă wall_mask)
+                # Dacă eșuează construcția pe mască, fallback la geometria vectorială outer-inner.
+                band_target = None
+                try:
+                    outer_mask = np.zeros((h, w), dtype=np.uint8)
+                    for g in valid_over:
+                        ext = getattr(g, "exterior", None)
+                        if ext is None:
+                            continue
+                        coords = list(getattr(ext, "coords", []))
+                        if len(coords) < 4:
+                            continue
+                        pts = np.array(
+                            [[int(round(float(c[0]))), int(round(float(c[1])))] for c in coords[:-1]],
+                            dtype=np.int32,
+                        ).reshape(-1, 1, 2)
+                        cv2.fillPoly(outer_mask, [pts], 255)
+                        for ring in getattr(g, "interiors", []):
+                            ic = list(getattr(ring, "coords", []))
+                            if len(ic) < 4:
+                                continue
+                            ipts = np.array(
+                                [[int(round(float(c[0]))), int(round(float(c[1])))] for c in ic[:-1]],
+                                dtype=np.int32,
+                            ).reshape(-1, 1, 2)
+                            cv2.fillPoly(outer_mask, [ipts], 0)
+                    inner_mask = (img > 0).astype(np.uint8) * 255
+                    band_mask = ((outer_mask > 0) & (inner_mask == 0)).astype(np.uint8) * 255
+                    # IMPORTANT: păstrăm și găurile (interiorul alb) din band_mask.
+                    contours, hierarchy = cv2.findContours(
+                        band_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
+                    )
+                    band_parts = []
+                    if hierarchy is not None and len(hierarchy) > 0:
+                        hinfo = hierarchy[0]
+                        for i, cnt in enumerate(contours):
+                            if cnt is None or len(cnt) < 3:
+                                continue
+                            # doar contururi exterioare
+                            if int(hinfo[i][3]) != -1:
+                                continue
+                            shell = [(float(p[0][0]), float(p[0][1])) for p in cnt]
+                            if len(shell) < 3:
+                                continue
+                            holes = []
+                            child = int(hinfo[i][2])
+                            while child != -1:
+                                cch = contours[child]
+                                if cch is not None and len(cch) >= 3:
+                                    hole = [(float(p[0][0]), float(p[0][1])) for p in cch]
+                                    if len(hole) >= 3:
+                                        holes.append(hole)
+                                child = int(hinfo[child][0])
+                            pg = ShapelyPolygon(shell, holes).buffer(0)
+                            if pg is not None and not getattr(pg, "is_empty", True):
+                                band_parts.append(pg)
+                    if band_parts:
+                        band_target = unary_union(band_parts).buffer(0)
+                except Exception:
+                    band_target = None
+                if band_target is None or getattr(band_target, "is_empty", True):
+                    band_target = outer_poly.difference(inner_poly.buffer(0))
+
+                # Pentru debug overhang evităm shrink pe bandă; celulele subțiri altfel dispar.
+                band_target_buf = band_target
+
+                def _face_ok(poly_pts: List[Tuple[float, float]]) -> bool:
+                    try:
+                        from shapely.geometry import Polygon as ShapelyPolygon
+                        fp = ShapelyPolygon(poly_pts)
+                        if fp.is_empty:
+                            return False
+                        inter_band = fp.intersection(band_target)
+                        in_band_area = float(getattr(inter_band, "area", 0.0) or 0.0)
+                        total_area = float(getattr(fp, "area", 0.0) or 0.0)
+                        if total_area <= 1e-6:
+                            return False
+                        # Prag relaxat pentru debug: acceptăm fețe care sunt preponderent în bandă.
+                        return (in_band_area / total_area) >= 0.90
+                    except Exception:
+                        return False
+
                 # ── Calculăm anchor segments (gri punctat): bulina → anchor ─────────────────────
                 ridge_int_pts_oh = _ridge_intersection_points(seg_ridge, tol=5.0) if seg_ridge else []
                 _tol_oh = 5.0
@@ -6346,7 +7696,8 @@ def generate_roof_type_outputs(
                         L_oh = (dx_oh * dx_oh + dy_oh * dy_oh) ** 0.5
                         if L_oh < 1e-12:
                             continue
-                        half_oh = 0.1 * L_oh
+                        # Trebuie identic cu lines.png: extensie mare ca să atingă banda overhang.
+                        half_oh = max(0.1 * L_oh, L_oh)
                         e0_oh = (r0_oh[0] - half_oh * (dx_oh / L_oh), r0_oh[1] - half_oh * (dy_oh / L_oh))
                         e1_oh = (r1_oh[0] + half_oh * (dx_oh / L_oh), r1_oh[1] + half_oh * (dy_oh / L_oh))
                         for oseg in seg_overhang:
@@ -6356,17 +7707,55 @@ def generate_roof_type_outputs(
                             o1_oh = (float(oseg[1][0]), float(oseg[1][1]))
                             ix, iy = _segment_intersection_2d(e0_oh, e1_oh, o0_oh, o1_oh)
                             if ix is not None and iy is not None:
+                                # Doar puncte de pe prelungirea ridge-ului (în afara capetelor segmentului original).
+                                seg_len_sq_oh = dx_oh * dx_oh + dy_oh * dy_oh
+                                if seg_len_sq_oh < 1e-20:
+                                    continue
+                                t_on_ridge_oh = ((ix - r0_oh[0]) * dx_oh + (iy - r0_oh[1]) * dy_oh) / seg_len_sq_oh
+                                if -1e-6 <= t_on_ridge_oh <= 1.0 + 1e-6:
+                                    continue
+                                # 4_w: în lines.png nu punem puncte ridge->overhang; păstrăm exact aceeași regulă.
+                                if roof_type == "4_w":
+                                    continue
                                 # Bulina albastru închis STRICT pe laturi perpendiculare pe ridge
                                 dx_o_oh = o1_oh[0] - o0_oh[0]
                                 dy_o_oh = o1_oh[1] - o0_oh[1]
                                 len_o_sq_oh = dx_o_oh * dx_o_oh + dy_o_oh * dy_o_oh
                                 if len_o_sq_oh >= 1e-20:
                                     dot_oh = dx_oh * dx_o_oh + dy_oh * dy_o_oh
-                                    if abs(dot_oh) > 0.17 * L_oh * (len_o_sq_oh ** 0.5):
+                                    # Trebuie IDENTIC cu lines.png: 2_w are prag mai strict (0.05), rest 0.17.
+                                    thresh_oh = 0.05 if roof_type == "2_w" else 0.17
+                                    if abs(dot_oh) > thresh_oh * L_oh * (len_o_sq_oh ** 0.5):
                                         continue
                                 overhang_ridge_pts_oh.append((ix, iy))
                 overhang_corner_pts_oh = [p for p in overhang_corner_pts_oh if not _near_ridge_int(p)]
                 overhang_ridge_pts_oh = [p for p in overhang_ridge_pts_oh if not _near_ridge_int(p)]
+                # Single source of truth: pentru faces, folosim strict bulinele calculate/desenate în lines.
+                strict_points_from_lines = False
+                if isinstance(lines_points, dict):
+                    lp_c = lines_points.get("overhang_corners") or []
+                    lp_r = lines_points.get("overhang_ridge_pts") or []
+                    if lp_c or lp_r:
+                        strict_points_from_lines = True
+                        overhang_corner_pts_oh = [(float(p[0]), float(p[1])) for p in lp_c]
+                        overhang_ridge_pts_oh = [(float(p[0]), float(p[1])) for p in lp_r]
+                # Garanție capete ridge pentru fețele overhang.
+                if not strict_points_from_lines:
+                    try:
+                        ridge_ext_pts_oh = _compute_overhang_ridge_pts(seg_ridge, seg_overhang, roof_type, tol=5.0)
+                        if ridge_ext_pts_oh:
+                            overhang_ridge_pts_oh.extend(ridge_ext_pts_oh)
+                            seen_oh = set()
+                            dedup_oh: List[Tuple[float, float]] = []
+                            for p in overhang_ridge_pts_oh:
+                                k = (round(float(p[0]), 2), round(float(p[1]), 2))
+                                if k in seen_oh:
+                                    continue
+                                seen_oh.add(k)
+                                dedup_oh.append((float(p[0]), float(p[1])))
+                            overhang_ridge_pts_oh = dedup_oh
+                    except Exception:
+                        pass
                 # 2_w: și extensiile ridge = buline albastre, le includem la anchor
                 if roof_type == "2_w" and overhang_ridge_pts_oh:
                     overhang_corner_pts_oh = list(overhang_corner_pts_oh) + list(overhang_ridge_pts_oh)
@@ -6374,6 +7763,55 @@ def generate_roof_type_outputs(
                     overhang_corner_pts_oh, overhang_ridge_pts_oh,
                     seg_ridge, seg_contour, seg_overhang, seg_pyramid, roof_type,
                     sections=sections,
+                )
+                # Fallback robust: pentru orice bulină albastră fără anchor, adăugăm segment către
+                # cel mai apropiat colț din baza overhang (seg_for_overhang_draw / seg_contour).
+                if not strict_points_from_lines:
+                    try:
+                        anchor_src_pts = list(dict.fromkeys(
+                            [(round(float(p[0]), 2), round(float(p[1]), 2)) for p in (overhang_corner_pts_oh + overhang_ridge_pts_oh)]
+                        ))
+                        contour_src = seg_for_overhang_draw if seg_for_overhang_draw else seg_contour
+                        contour_anchor_pts: List[Tuple[float, float]] = []
+                        seen_cap = set()
+                        for s in (contour_src or []):
+                            if len(s) < 2:
+                                continue
+                            for ep in (s[0], s[1]):
+                                q = (round(float(ep[0]), 2), round(float(ep[1]), 2))
+                                if q in seen_cap:
+                                    continue
+                                seen_cap.add(q)
+                                contour_anchor_pts.append((float(ep[0]), float(ep[1])))
+                        # indexăm punctele sursă care au deja anchor
+                        anchored_src: List[Tuple[float, float]] = []
+                        for s in anchor_segments:
+                            if len(s) < 2:
+                                continue
+                            anchored_src.append((round(float(s[0][0]), 2), round(float(s[0][1]), 2)))
+                        for sp in anchor_src_pts:
+                            has_anchor = any((sp[0] - ap[0]) ** 2 + (sp[1] - ap[1]) ** 2 <= 1.5 * 1.5 for ap in anchored_src)
+                            if has_anchor or not contour_anchor_pts:
+                                continue
+                            sx, sy = float(sp[0]), float(sp[1])
+                            best = None
+                            best_d2 = 1e30
+                            for qx, qy in contour_anchor_pts:
+                                d2 = (sx - qx) ** 2 + (sy - qy) ** 2
+                                if d2 < best_d2:
+                                    best_d2 = d2
+                                    best = (qx, qy)
+                            if best is not None and best_d2 > 1e-8:
+                                anchor_segments.append([[sx, sy], [float(best[0]), float(best[1])]])
+                    except Exception:
+                        pass
+                # Regula darkblue:
+                #  - fără gray sursă => eliminat
+                #  - pe același gray păstrăm doar darkblue-ul cel mai apropiat
+                overhang_ridge_pts_oh = _filter_ridge_pts_by_anchor_segments(
+                    overhang_ridge_pts_oh,
+                    anchor_segments,
+                    match_tol=2.0,
                 )
 
                 # ── Construim toate liniile pentru bandă și polygonize ───────────────────────────
@@ -6394,6 +7832,55 @@ def generate_roof_type_outputs(
                             (float(s[0][0]), float(s[0][1])),
                             (float(s[1][0]), float(s[1][1])),
                         ]))
+                # Construim tăietori compleți pe direcția anchor-ului (prin bulina gri), dintr-o
+                # frontieră a benzii în cealaltă. Astfel se pot despica celulele lungi în 2+ fețe.
+                try:
+                    boundary_lines = list(overhang_lines) + (list(base_lines) if base_lines else [])
+                    boundary_union = unary_union(boundary_lines) if boundary_lines else None
+                    for s in anchor_segments:
+                        if len(s) < 2 or boundary_union is None:
+                            continue
+                        ax0, ay0 = float(s[0][0]), float(s[0][1])
+                        gx, gy = float(s[1][0]), float(s[1][1])  # capătul gri
+                        vx, vy = gx - ax0, gy - ay0
+                        L = (vx * vx + vy * vy) ** 0.5
+                        if L < 1e-6:
+                            continue
+                        ux, uy = vx / L, vy / L
+                        ray_len = max(float(w), float(h)) * 3.0
+                        full_line = LineString([
+                            (gx - ux * ray_len, gy - uy * ray_len),
+                            (gx + ux * ray_len, gy + uy * ray_len),
+                        ])
+                        inter = full_line.intersection(boundary_union)
+                        if inter is None or getattr(inter, "is_empty", True):
+                            continue
+                        cand_pts: List[Tuple[float, float]] = []
+                        geoms = list(getattr(inter, "geoms", None) or [inter])
+                        for gg in geoms:
+                            x = getattr(gg, "x", None)
+                            y = getattr(gg, "y", None)
+                            if x is not None and y is not None:
+                                cand_pts.append((float(x), float(y)))
+                                continue
+                            coords = list(getattr(gg, "coords", []) or [])
+                            if len(coords) >= 2:
+                                cand_pts.append((float(coords[0][0]), float(coords[0][1])))
+                                cand_pts.append((float(coords[-1][0]), float(coords[-1][1])))
+                        if not cand_pts:
+                            continue
+                        ts = [((px - gx) * ux + (py - gy) * uy, (px, py)) for (px, py) in cand_pts]
+                        neg = [it for it in ts if it[0] < -1.0]
+                        pos = [it for it in ts if it[0] > 1.0]
+                        if not neg or not pos:
+                            continue
+                        p0 = max(neg, key=lambda it: it[0])[1]  # cel mai apropiat dinspre minus
+                        p1 = min(pos, key=lambda it: it[0])[1]  # cel mai apropiat dinspre plus
+                        cutter = LineString([p0, p1])
+                        if float(getattr(cutter, "length", 0.0) or 0.0) > 2.0:
+                            raw_band_lines.append(cutter)
+                except Exception:
+                    pass
 
                 # NODDING: unary_union împarte liniile la toate intersecțiile — fără asta polygonize nu creează celule mici
                 try:
@@ -6413,61 +7900,215 @@ def generate_roof_type_outputs(
                 band_polys, _, _, _ = polygonize_full(all_band_lines)
                 band_geoms = list(getattr(band_polys, "geoms", None) or [band_polys])
                 added_band_count = 0
-                # Buffer mic pe inner: 0.2 în loc de 0.5 ca să nu excludem fețe la marginea benzii
-                inner_poly_buf = inner_poly.buffer(0.2) if inner_poly is not None else None
-                outer_poly_buf = outer_poly.buffer(1.0) if outer_poly is not None else None
+                # Fețele overhang se construiesc strict din punctele marcate în lines.png:
+                # lightblue (corner/intersection), darkblue (ridge->overhang), gray (anchors).
+                def _incident_dirs_local(
+                    pt: Tuple[float, float],
+                    segs: List[List[List[float]]],
+                    tol: float = 0.8,
+                ) -> List[Tuple[float, float]]:
+                    dirs: List[Tuple[float, float]] = []
+                    px, py = pt
+                    for s in segs:
+                        if len(s) < 2:
+                            continue
+                        a = (float(s[0][0]), float(s[0][1]))
+                        b = (float(s[1][0]), float(s[1][1]))
+                        qx, qy, d2 = _closest_point_on_segment((px, py), a, b)
+                        if d2 > tol * tol:
+                            continue
+                        da = ((a[0] - px) ** 2 + (a[1] - py) ** 2) ** 0.5
+                        db = ((b[0] - px) ** 2 + (b[1] - py) ** 2) ** 0.5
+                        if da > 1e-6:
+                            dirs.append(((a[0] - px) / da, (a[1] - py) / da))
+                        if db > 1e-6:
+                            dirs.append(((b[0] - px) / db, (b[1] - py) / db))
+                    uniq: List[Tuple[float, float]] = []
+                    for vx, vy in dirs:
+                        keep = True
+                        for ux, uy in uniq:
+                            if (vx - ux) ** 2 + (vy - uy) ** 2 <= 0.05 * 0.05:
+                                keep = False
+                                break
+                        if keep:
+                            uniq.append((vx, vy))
+                    return uniq
+
+                # Lightblue: doar puncte de colț/intersecție reale (nu treceri drepte).
+                corner_raw = list(dict.fromkeys([(round(p[0], 2), round(p[1], 2)) for p in overhang_corner_pts_oh]))
+                corner_pts: List[Tuple[float, float]] = []
+                for p in corner_raw:
+                    dirs = _incident_dirs_local((float(p[0]), float(p[1])), seg_overhang)
+                    if len(dirs) <= 1:
+                        continue
+                    if len(dirs) == 2:
+                        dot = dirs[0][0] * dirs[1][0] + dirs[0][1] * dirs[1][1]
+                        if dot < -0.98:
+                            continue
+                    corner_pts.append((float(p[0]), float(p[1])))
+
+                # Darkblue: punctele ridge->overhang
+                ridge_pts = list(dict.fromkeys([(round(p[0], 2), round(p[1], 2)) for p in overhang_ridge_pts_oh]))
+                blue_pts = list(dict.fromkeys(corner_pts + [(float(p[0]), float(p[1])) for p in ridge_pts]))
+                gray_pts = []
+                for s in anchor_segments:
+                    if len(s) >= 2:
+                        gray_pts.append((round(float(s[1][0]), 2), round(float(s[1][1]), 2)))
+                gray_pts = list(dict.fromkeys(gray_pts))
+                allowed_pts = blue_pts + gray_pts
+                allowed_pts = list(dict.fromkeys(allowed_pts))
+                faces_used_points = (
+                    [{"x": float(p[0]), "y": float(p[1]), "kind": "lightblue"} for p in corner_pts]
+                    + [{"x": float(p[0]), "y": float(p[1]), "kind": "darkblue"} for p in ridge_pts]
+                    + [{"x": float(p[0]), "y": float(p[1]), "kind": "gray"} for p in gray_pts]
+                    + [{"x": float(p[0]), "y": float(p[1]), "kind": "yellow"} for p in ridge_midpoints_faces]
+                )
+                # faces.png trebuie să folosească STRICT bulinele din lines.png (single source of truth)
+                if isinstance(lines_points, dict):
+                    lp_c = lines_points.get("overhang_corners") or []
+                    lp_r = lines_points.get("overhang_ridge_pts") or []
+                    lp_g = lines_points.get("gray_anchor_pts") or []
+                    faces_used_points = (
+                        [{"x": float(p[0]), "y": float(p[1]), "kind": "lightblue"} for p in lp_c]
+                        + [{"x": float(p[0]), "y": float(p[1]), "kind": "darkblue"} for p in lp_r]
+                        + [{"x": float(p[0]), "y": float(p[1]), "kind": "gray"} for p in lp_g]
+                        + [{"x": float(p[0]), "y": float(p[1]), "kind": "yellow"} for p in ridge_midpoints_faces]
+                    )
+
+                # Construim fețe overhang DOAR din segmentele:
+                #  - baza overhang (base_lines)
+                #  - overhang 1m (overhang_lines)
+                #  - ancorele gri (anchor_segments)
+                # și păstrăm doar celulele rezultate direct din polygonize.
+                roof_faces = polygons_2d[:num_roof_polygons]
+                clean_over: List[List[Tuple[float, float]]] = []
                 for g in band_geoms:
                     if g is None or getattr(g, "is_empty", True):
                         continue
                     try:
-                        a_g = float(getattr(g, "area", 0) or 0)
-                        if a_g < 0.5:
-                            continue
-                        cent = g.centroid
-                        if cent is None or getattr(cent, "is_empty", True):
-                            continue
-                        # Filtru principal: centroid TREBUIE să fie în outer și NU în inner
-                        in_outer = (
-                            outer_poly_buf.contains(cent)
-                            if outer_poly_buf is not None
-                            else outer_poly.buffer(2).contains(cent)
-                        )
-                        if not in_outer:
-                            continue
-                        in_inner = (
-                            inner_poly_buf.contains(cent)
-                            if inner_poly_buf is not None
-                            else inner_poly.contains(cent)
-                        )
-                        if in_inner:
+                        area_g = float(getattr(g, "area", 0.0) or 0.0)
+                        # Prag minim de arie relaxat pentru fețe subțiri la muchii.
+                        if area_g < 0.05:
                             continue
                         ext = getattr(g, "exterior", None)
                         if ext is None:
                             continue
                         coords = list(getattr(ext, "coords", []))
-                        if len(coords) >= 4:
-                            pts = [(float(c[0]), float(c[1])) for c in coords[:-1]]
-                            polygons_2d.append(pts)
-                            added_band_count += 1
+                        if len(coords) < 4:
+                            continue
+                        pts = [(float(c[0]), float(c[1])) for c in coords[:-1]]
+                        if _face_ok(pts):
+                            clean_over.append(pts)
                     except Exception:
-                        pass
+                        continue
+                # Merge pentru duplicate naturale:
+                # - NU unificăm peste separatori reali (muchii cu buline gri/albastre)
+                # - unificăm și forme cu >4 vârfuri când reprezintă aceeași bandă logică.
+                try:
+                    from shapely.geometry import Polygon as ShapelyPolygon, Point as ShapelyPoint
 
-                # Fallback dacă polygonize nu a dat nimic: banda simplă (outer minus inner)
-                if added_band_count == 0:
-                    try:
-                        band = outer_poly.difference(inner_poly.buffer(0))
-                        if band is not None and not getattr(band, "is_empty", True):
-                            for g in (getattr(band, "geoms", None) or [band]):
-                                if g is None or getattr(g, "is_empty", True):
+                    def _poly_from_pts(pts: List[Tuple[float, float]]) -> Optional[Any]:
+                        if len(pts) < 3:
+                            return None
+                        try:
+                            p = ShapelyPolygon([(float(x), float(y)) for (x, y) in pts]).buffer(0)
+                            if p is None or getattr(p, "is_empty", True) or hasattr(p, "geoms"):
+                                return None
+                            return p
+                        except Exception:
+                            return None
+
+                    def _pts_from_poly(p: Any) -> List[Tuple[float, float]]:
+                        ext = getattr(p, "exterior", None)
+                        if ext is None:
+                            return []
+                        coords = list(getattr(ext, "coords", []))
+                        if len(coords) < 4:
+                            return []
+                        out = [(float(c[0]), float(c[1])) for c in coords[:-1]]
+                        # eliminăm coliniare consecutive
+                        if len(out) <= 3:
+                            return out
+                        simp: List[Tuple[float, float]] = []
+                        n = len(out)
+                        for i in range(n):
+                            a = out[(i - 1) % n]
+                            b = out[i]
+                            c = out[(i + 1) % n]
+                            abx, aby = b[0] - a[0], b[1] - a[1]
+                            bcx, bcy = c[0] - b[0], c[1] - b[1]
+                            cross = abs(abx * bcy - aby * bcx)
+                            if cross > 1e-5:
+                                simp.append(b)
+                        return simp if len(simp) >= 3 else out
+
+                    protected_pts = [(float(p[0]), float(p[1])) for p in allowed_pts]
+                    protected_tol = 1.6
+
+                    def _shared_edge_has_protected_point(pi: Any, pj: Any) -> bool:
+                        try:
+                            inter = pi.boundary.intersection(pj.boundary)
+                            if inter is None or getattr(inter, "is_empty", True):
+                                return False
+                            for qx, qy in protected_pts:
+                                qp = ShapelyPoint(qx, qy)
+                                if float(inter.distance(qp)) <= protected_tol:
+                                    return True
+                            return False
+                        except Exception:
+                            return False
+
+                    work = [p for p in clean_over if len(p) >= 3]
+                    changed = True
+                    loops = 0
+                    while changed and loops < 200:
+                        loops += 1
+                        changed = False
+                        polys = [_poly_from_pts(p) for p in work]
+                        best = None
+                        best_shared = 0.0
+                        for i in range(len(polys)):
+                            pi = polys[i]
+                            if pi is None:
+                                continue
+                            for j in range(i + 1, len(polys)):
+                                pj = polys[j]
+                                if pj is None:
                                     continue
-                                ext = getattr(g, "exterior", None)
-                                if ext is not None:
-                                    coords = list(getattr(ext, "coords", []))
-                                    if len(coords) >= 4:
-                                        pts = [(float(c[0]), float(c[1])) for c in coords[:-1]]
-                                        polygons_2d.append(pts)
-                    except Exception:
-                        pass
+                                shared = float(getattr(pi.boundary.intersection(pj.boundary), "length", 0.0) or 0.0)
+                                if shared <= 1e-4:
+                                    continue
+                                # Nu unim peste muchii "intenționate" de bulinele gri/albastre.
+                                if _shared_edge_has_protected_point(pi, pj):
+                                    continue
+                                u = pi.union(pj).buffer(0)
+                                if u is None or getattr(u, "is_empty", True) or hasattr(u, "geoms"):
+                                    continue
+                                cand = _pts_from_poly(u)
+                                # Acceptăm și poligoane puțin mai complexe (ex. 24+10+28),
+                                # dar evităm uniuni foarte zimțate.
+                                if len(cand) < 3 or len(cand) > 8:
+                                    continue
+                                if not _face_ok(cand):
+                                    continue
+                                if shared > best_shared:
+                                    best_shared = shared
+                                    best = (i, j, cand)
+                        if best is None:
+                            break
+                        i, j, merged = best
+                        nxt = []
+                        for k, p in enumerate(work):
+                            if k in (i, j):
+                                continue
+                            nxt.append(p)
+                        nxt.append(merged)
+                        work = nxt
+                        changed = True
+                    clean_over = work
+                except Exception:
+                    pass
+                polygons_2d = roof_faces + clean_over
 
             except Exception:
                 # Fallback complet: adăugăm overhang la segmente și polygonize normal
@@ -6481,7 +8122,14 @@ def generate_roof_type_outputs(
             roof_type, sections, img,
             wall_height=wall_height, roof_angle_deg=effective_angle,
         )
-        _draw_faces_png(img, polygons_2d, subdir / "faces.png", roof_type=roof_type, seed=hash(roof_type) % (2**32))
+        _draw_faces_png(
+            img,
+            polygons_2d,
+            subdir / "faces.png",
+            roof_type=roof_type,
+            seed=hash(roof_type) % (2**32),
+            used_points=faces_used_points,
+        )
 
         try:
             from roof_calc.roof_segments_3d import (
@@ -6492,7 +8140,6 @@ def generate_roof_type_outputs(
             )
             from roof_calc.flood_fill import flood_fill_interior, get_house_shape_mask
             from roof_calc.geometry import extract_polygon
-            from roof_calc.overhang import ridge_intersection_corner_lines
 
             overhang_corner_list: List[List[float]] = []
             overhang_ridge_list: List[List[float]] = []
@@ -6502,8 +8149,8 @@ def generate_roof_type_outputs(
             if floor_poly is not None and not floor_poly.is_empty and polygons_2d:
                 secs = _sections_for_1w_shed(sections) if roof_type in ("0_w", "1_w") else sections
                 corner_lines = (
-                    ridge_intersection_corner_lines(sections, per_section=False)
-                    if roof_type not in ("4.5_w", "4_w") and _has_ridge_intersection(sections)
+                    _ridge_corner_lines_by_component(sections)
+                    if roof_type not in ("4.5_w", "4_w")
                     else None
                 )
                 segments_3d = get_roof_segments_3d(
@@ -6555,6 +8202,13 @@ def generate_roof_type_outputs(
                                 o1 = (float(oseg[1][0]), float(oseg[1][1]))
                                 ix, iy = _segment_intersection_2d(e0, e1, o0, o1)
                                 if ix is not None and iy is not None:
+                                    # Doar puncte de pe prelungirea ridge-ului (în afara segmentului original).
+                                    seg_len_sq = dx * dx + dy * dy
+                                    if seg_len_sq < 1e-20:
+                                        continue
+                                    t_on_ridge = ((ix - r0[0]) * dx + (iy - r0[1]) * dy) / seg_len_sq
+                                    if -1e-6 <= t_on_ridge <= 1.0 + 1e-6:
+                                        continue
                                     dx_o = o1[0] - o0[0]
                                     dy_o = o1[1] - o0[1]
                                     len_o_sq = dx_o * dx_o + dy_o * dy_o
@@ -6591,6 +8245,22 @@ def generate_roof_type_outputs(
                         return False
                     overhang_corner_list = [p for p in overhang_corner_list if not _near(p)]
                     overhang_ridge_list = [p for p in overhang_ridge_list if not _near(p)]
+                # Garanție capete ridge pentru marker-ele 3D.
+                try:
+                    ridge_ext_pts_3d = _compute_overhang_ridge_pts(seg_ridge, seg_overhang, roof_type, tol=5.0)
+                    if ridge_ext_pts_3d:
+                        overhang_ridge_list.extend([[float(p[0]), float(p[1])] for p in ridge_ext_pts_3d])
+                        seen3 = set()
+                        dedup3: List[List[float]] = []
+                        for p in overhang_ridge_list:
+                            k = (round(float(p[0]), 2), round(float(p[1]), 2))
+                            if k in seen3:
+                                continue
+                            seen3.add(k)
+                            dedup3.append([float(p[0]), float(p[1])])
+                        overhang_ridge_list = dedup3
+                except Exception:
+                    pass
                 # Z pentru vârfurile fețelor overhang: albastru închis (ridge), albastru deschis (colțuri) = același Z ca bulinele (poate fi sub wh), gri (anchor) la wall_height
                 ridge_z_val = max(float(p[2]) for s in segments_3d for p in s) if segments_3d else wall_height
                 overhang_z_override: Dict[Tuple[float, float], float] = {}
@@ -6665,6 +8335,13 @@ def generate_roof_type_outputs(
                                     overhang_z_override[k] = wall_height
                     except Exception:
                         anchor_segs_for_z = []
+                # Aplicăm aceeași regulă și în 3D pentru marker-ele darkblue.
+                overhang_ridge_list_t = _filter_ridge_pts_by_anchor_segments(
+                    [(float(p[0]), float(p[1])) for p in (overhang_ridge_list or [])],
+                    anchor_segs_for_z,
+                    match_tol=2.0,
+                )
+                overhang_ridge_list = [[float(p[0]), float(p[1])] for p in overhang_ridge_list_t]
 
                 def _z_for_vertex(px: float, py: float) -> float:
                     k = (round(px, 2), round(py, 2))
@@ -6672,11 +8349,35 @@ def generate_roof_type_outputs(
                         return overhang_z_override[k]
                     return _lookup_z(px, py, xy_to_z, 5.0, segments_fallback)
 
+                # Gri din ridge_anchor_pairs: același Z ca darkblue-ul pereche (ca în frame.html Plotly),
+                # ca mesh-ul și colțurile fețelor să urce la înălțimea bulinelor gri.
+                pairs_mesh = (
+                    (lines_points or {}).get("ridge_anchor_pairs") or []
+                    if isinstance(lines_points, dict)
+                    else []
+                )
+                for pr in pairs_mesh:
+                    if not isinstance(pr, (list, tuple)) or len(pr) < 2:
+                        continue
+                    try:
+                        rp = pr[0]
+                        gp = pr[1]
+                        gk = (round(float(gp[0]), 2), round(float(gp[1]), 2))
+                    except Exception:
+                        continue
+                    dz = _z_for_vertex(float(rp[0]), float(rp[1]))
+                    overhang_z_override[gk] = float(dz)
+
                 # Puncte canonice = coordonate exacte din segmente și markere (ridge, contur, overhang, ancore)
-                # pentru ca fețele 3D să folosească aceleași (x,y,z) ca liniile și bulinele
+                # pentru ca fețele 3D să folosească aceleași (x,y,z) ca liniile și bulinele.
+                # IMPORTANT: ignorăm punctele intermediare de pe polilinii (ex. midpoint ridge din lines),
+                # altfel un punct intern poate "atrage" Z-ul colțului și poate coborî fața.
                 canonical_xyz: List[Tuple[float, float, float]] = []
                 for seg in segments_3d:
-                    for p in seg:
+                    if not seg:
+                        continue
+                    endpoints = [seg[0]] if len(seg) == 1 else [seg[0], seg[-1]]
+                    for p in endpoints:
                         canonical_xyz.append((float(p[0]), float(p[1]), float(p[2])))
                 for p in (overhang_corner_list or []):
                     canonical_xyz.append((float(p[0]), float(p[1]), overhang_z_override.get((round(float(p[0]), 2), round(float(p[1]), 2)), wall_height)))
@@ -6686,38 +8387,112 @@ def generate_roof_type_outputs(
                     if len(s) >= 2:
                         for pt in (s[0], s[1]):
                             if len(pt) >= 2:
-                                canonical_xyz.append((float(pt[0]), float(pt[1]), wall_height))
+                                _ak = (round(float(pt[0]), 2), round(float(pt[1]), 2))
+                                _az = float(overhang_z_override.get(_ak, wall_height))
+                                canonical_xyz.append((float(pt[0]), float(pt[1]), _az))
+
+                # Marker-ele din lines/faces sunt sursa de adevăr pentru colțuri;
+                # prioritar facem snap pe ele, astfel toate fețele respectă bulinele din colțuri.
+                marker_xyz: List[Tuple[float, float, float]] = []
+                for mp in (faces_used_points or []):
+                    try:
+                        mx = float(mp.get("x"))
+                        my = float(mp.get("y"))
+                        kind = str(mp.get("kind") or "")
+                    except Exception:
+                        continue
+                    if kind == "yellow":
+                        # Midpoint-urile ridge sunt informative; nu influențează geometria fețelor.
+                        continue
+                    mz = float(_z_for_vertex(mx, my))
+                    marker_xyz.append((mx, my, mz))
 
                 _snap_tol_sq = 4.0  # 2 px
+                _marker_snap_tol_sq = 36.0  # 6 px - marker priority snap
 
-                def _snapped_vertex(px: float, py: float) -> List[float]:
-                    """Returnează (x, y, z) snapping la punctul canonic cel mai apropiat, ca fețele să coincidă cu ridge/contur/overhang."""
+                def _vertex_from_face_corner(px: float, py: float) -> List[float]:
+                    """
+                    Pentru fiecare față din faces.png:
+                    - XY rămâne EXACT colțul feței (nu mutăm colțurile)
+                    - Z se aliniază la markerul cel mai apropiat când există, altfel fallback geometric.
+                    """
                     px, py = float(px), float(py)
-                    best_x, best_y, best_z = px, py, _z_for_vertex(px, py)
+                    best_z = _z_for_vertex(px, py)
+                    # 1) Z prioritar din marker-ele din faces/lines (fără schimbare XY)
+                    best_md2 = 1e30
+                    for (mx, my, mz) in marker_xyz:
+                        d2 = (px - mx) ** 2 + (py - my) ** 2
+                        if d2 <= _marker_snap_tol_sq and d2 < best_md2:
+                            best_md2 = d2
+                            best_z = mz
+                    if best_md2 < 1e30:
+                        return [px, py, best_z]
+                    # 2) fallback la puncte canonice din segmente (doar Z, fără snap XY)
                     best_d2 = 1e30
+                    best_cz = best_z
                     for (cx, cy, cz) in canonical_xyz:
                         d2 = (px - cx) ** 2 + (py - cy) ** 2
                         if d2 <= _snap_tol_sq and d2 < best_d2:
                             best_d2 = d2
-                            best_x, best_y, best_z = cx, cy, cz
-                    return [best_x, best_y, best_z]
+                            best_cz = cz
+                    return [px, py, best_cz]
 
                 faces_from_polygons_2d = [
                     {
-                        "vertices_3d": [_snapped_vertex(float(p[0]), float(p[1])) for p in poly]
+                        "vertices_3d": [_vertex_from_face_corner(float(p[0]), float(p[1])) for p in poly]
                     }
                     for poly in polygons_2d
                 ]
+                # Sudăm colțurile aproape-coincidente între fețe ca muchiile să rămână lipite.
+                # Z pe cluster = max, ca un colț comun să nu fie tras în jos de un fallback local.
+                try:
+                    _weld_tol = 1.5  # px
+                    cluster_centers: List[Tuple[float, float]] = []
+                    cluster_vertices: List[List[Tuple[int, int, float, float, float]]] = []
+                    for fi, ff in enumerate(faces_from_polygons_2d):
+                        vs = ff.get("vertices_3d") or []
+                        for vi, vv in enumerate(vs):
+                            if not isinstance(vv, (list, tuple)) or len(vv) < 3:
+                                continue
+                            vx, vy, vz = float(vv[0]), float(vv[1]), float(vv[2])
+                            best_ci = -1
+                            best_d2 = 1e30
+                            for ci, (cx, cy) in enumerate(cluster_centers):
+                                d2 = (vx - cx) ** 2 + (vy - cy) ** 2
+                                if d2 < best_d2:
+                                    best_d2 = d2
+                                    best_ci = ci
+                            if best_ci >= 0 and best_d2 <= _weld_tol * _weld_tol:
+                                cluster_vertices[best_ci].append((fi, vi, vx, vy, vz))
+                                pts = cluster_vertices[best_ci]
+                                sx = sum(p[2] for p in pts)
+                                sy = sum(p[3] for p in pts)
+                                cluster_centers[best_ci] = (sx / len(pts), sy / len(pts))
+                            else:
+                                cluster_centers.append((vx, vy))
+                                cluster_vertices.append([(fi, vi, vx, vy, vz)])
+                    for ci, pts in enumerate(cluster_vertices):
+                        if not pts:
+                            continue
+                        rx, ry = cluster_centers[ci]
+                        rz = max(p[4] for p in pts)
+                        for fi, vi, _vx, _vy, _vz in pts:
+                            faces_from_polygons_2d[fi]["vertices_3d"][vi] = [float(rx), float(ry), float(rz)]
+                except Exception:
+                    pass
             else:
                 faces_from_polygons_2d = [{"vertices_3d": f.get("vertices_3d", [])} for f in faces_data]
-            src_ridge = ridge_segs if roof_type in ("4.5_w", "4_w") and use_ridge_trimmed else seg_ridge
             ridge_midpoints = []
-            for s in (src_ridge or []):
-                if len(s) >= 2:
-                    ridge_midpoints.append([
-                        (float(s[0][0]) + float(s[1][0])) / 2.0,
-                        (float(s[0][1]) + float(s[1][1])) / 2.0,
-                    ])
+            if roof_type == "4_w":
+                ridge_midpoints = [[float(p[0]), float(p[1])] for p in _section_centers(sections or [])]
+            else:
+                src_ridge = ridge_segs if roof_type == "4.5_w" and use_ridge_trimmed else seg_ridge
+                for s in (src_ridge or []):
+                    if len(s) >= 2:
+                        ridge_midpoints.append([
+                            (float(s[0][0]) + float(s[1][0])) / 2.0,
+                            (float(s[0][1]) + float(s[1][1])) / 2.0,
+                        ])
             ridge_pink_list = [[float(p[0]), float(p[1])] for p in (ridge_pink or [])]
             brown_markers = [[[float(pt[0]), float(pt[1])], pid] for pt, pid in (brown_endpoint_markers or [])]
             # overhang_corner_list și overhang_ridge_list sunt deja calculate mai sus (în blocul if floor_poly)
@@ -6759,6 +8534,8 @@ def generate_roof_type_outputs(
                     "brown_endpoints": brown_markers,
                     "overhang_corners": overhang_corner_list,
                     "overhang_ridge_pts": overhang_ridge_list,
+                    "faces_points": faces_used_points,
+                    "ridge_anchor_pairs": ((lines_points or {}).get("ridge_anchor_pairs") or []),
                 },
             }
             (subdir / "faces_faces.json").write_text(json.dumps(payload, indent=0), encoding="utf-8")
