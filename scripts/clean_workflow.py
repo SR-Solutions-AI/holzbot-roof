@@ -870,8 +870,11 @@ def run_clean_workflow(
         if edited_p.exists():
             edited_sections = _sections_from_edited_json(edited_p, len(all_floor_paths))
             if edited_sections:
+                # Suprascriem DOAR etajele prezente în JSON-ul editat.
+                # Dacă un etaj nu apare în fișier, păstrăm dreptunghiurile detectate automat.
                 for output_idx, floor_path in enumerate(all_floor_paths):
-                    path_to_remaining[_norm_path(floor_path)] = edited_sections.get(output_idx, [])
+                    if output_idx in edited_sections:
+                        path_to_remaining[_norm_path(floor_path)] = edited_sections[output_idx]
                 print(f"   ✓ Folosesc secțiuni editate din: {edited_p}")
     # Ordinea pentru overlay/offsets trebuie să fie all_floor_paths ca "0"/"1" să corespundă floor_0/floor_1
     ordered_paths = list(all_floor_paths)
@@ -1035,7 +1038,7 @@ def run_clean_workflow(
             except Exception as e:
                 print(f"   ⚠ rectangles/floor_{output_idx}: {e}")
         else:
-            print(f"   ✓ rectangles/floor_{output_idx}/: 0 dreptunghiuri (acoperiș plat / 0_w)")
+            print(f"   ✓ rectangles/floor_{output_idx}/: 0 dreptunghiuri")
 
         if rectangles_only:
             continue
