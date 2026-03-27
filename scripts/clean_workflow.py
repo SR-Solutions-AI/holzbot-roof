@@ -8,6 +8,7 @@ Workflow curat:
 import json
 import os
 import sys
+import hashlib
 from collections import defaultdict
 from pathlib import Path
 from typing import List, Optional, Tuple, Any, Dict
@@ -32,6 +33,28 @@ from roof_calc.roof_types_workflow import (
 )
 
 import cv2
+
+
+def _debug_enabled() -> bool:
+    return True
+
+
+def _dbg(msg: str) -> None:
+    if _debug_enabled():
+        print(f"[clean_workflow:debug] {msg}", flush=True)
+
+
+def _mask_debug_stats(path: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        return f"missing path={p}"
+    img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return f"unreadable path={p}"
+    nz = int((img > 0).sum())
+    h, w = img.shape[:2]
+    md5 = hashlib.md5(img.tobytes()).hexdigest()[:12]
+    return f"path={p} shape={w}x{h} nonzero={nz} md5={md5}"
 
 
 def _footprint_section_from_wall_mask(wall_mask_path: str) -> Optional[dict]:
@@ -724,6 +747,7 @@ def run_clean_workflow(
 ) -> None:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    _dbg(f"start wall_mask_path={wall_mask_path} output_dir={output_dir} rectangles_only={rectangles_only} edited_json_path={edited_json_path}")
 
     # Încarcă unghiuri per etaj din floor_roof_angles.json (extrase de Gemini din side_view)
     floor_roof_angles: dict = {}
@@ -749,6 +773,8 @@ def run_clean_workflow(
             print(f"⚠ Fișier nu există: {wall_mask_path}")
             return
         all_floor_paths = [wall_mask_path]
+    for i, fp in enumerate(all_floor_paths):
+        _dbg(f"floor_input idx={i} {_mask_debug_stats(fp)}")
 
     # Încarcă unghiuri per etaj din floor_roof_angles.json (din Gemini/side_view)
     floor_roof_angles: dict[int, float] = {}
@@ -759,6 +785,7 @@ def run_clean_workflow(
             floor_roof_angles = {int(k): float(v) for k, v in (fra_data or {}).items()}
         except Exception:
             pass
+    _dbg(f"angles_loaded path={fra_path} angles={floor_roof_angles}")
     default_angle = 30.0
 
     floor_roof_results: List[dict] = []
@@ -766,9 +793,13 @@ def run_clean_workflow(
         angle = floor_roof_angles.get(i, default_angle)
         # Validation allows roof_angle in [15, 60]; use clamped value for API, keep angle for footprint logic
         api_angle = angle if 15 <= angle <= 60 else default_angle
+        _dbg(f"calculate start floor={i} angle={angle} api_angle={api_angle} overhang_px=2.0")
         try:
             res = calculate_roof_from_walls(fp, roof_angle=api_angle, overhang_px=2.0)
             floor_roof_results.append(res)
+            sections = res.get("sections") or []
+            err = res.get("error")
+            _dbg(f"calculate done floor={i} sections={len(sections)} error={err!r}")
         except Exception as e:
             print(f"⚠ {Path(fp).name}: {e}", flush=True)
             floor_roof_results = []
@@ -780,8 +811,13 @@ def run_clean_workflow(
             angle = floor_roof_angles.get(i, default_angle)
             api_angle = angle if 15 <= angle <= 60 else default_angle
             try:
-                floor_roof_results.append(calculate_roof_from_walls(fp, roof_angle=api_angle, overhang_px=2.0))
-            except Exception:
+                res = calculate_roof_from_walls(fp, roof_angle=api_angle, overhang_px=2.0)
+                floor_roof_results.append(res)
+                sections = res.get("sections") or []
+                err = res.get("error")
+                _dbg(f"calculate retry floor={i} sections={len(sections)} error={err!r}")
+            except Exception as e:
+                _dbg(f"calculate retry floor={i} raised={e!r}")
                 floor_roof_results.append({"sections": []})
 
     # La unghi 0° (acoperiș plat), calculate_roof_from_walls poate returna sections goale → generăm 1 dreptunghi footprint
@@ -795,10 +831,14 @@ def run_clean_workflow(
             footprint = _footprint_section_from_wall_mask(str(fp))
             if footprint:
                 floor_roof_results[i] = {**res, "sections": [footprint]}
+                _dbg(f"footprint fallback floor={i} added=1")
+            else:
+                _dbg(f"footprint fallback floor={i} failed")
 
     floors_ordered = _ordered_floor_polygons(all_floor_paths, None, floor_roof_results)
     if not floors_ordered:
         floors_ordered = [(p, None) for p in all_floor_paths]
+    _dbg(f"floors_ordered={[Path(p).name for p, _ in floors_ordered]}")
 
     path_to_result = {all_floor_paths[i]: floor_roof_results[i] for i in range(len(all_floor_paths))}
 
@@ -826,6 +866,7 @@ def run_clean_workflow(
                 basement_floor_index = int(raw_bfi)
         except Exception:
             basement_floor_index = None
+    _dbg(f"basement_floor_index={basement_floor_index}")
 
     floors_with_rects: List[Tuple[int, str, list]] = []
     for floor_idx, (floor_path, _) in enumerate(floors_ordered):
@@ -834,9 +875,11 @@ def run_clean_workflow(
             continue
         res = path_to_result.get(floor_path)
         if res is None:
+            _dbg(f"pre-filter floor={floor_idx} path={Path(floor_path).name} result=missing")
             continue
         sections = res.get("sections") or []
         if not sections:
+            _dbg(f"pre-filter floor={floor_idx} path={Path(floor_path).name} sections=0 error={res.get('error')!r}")
             continue
         # Group by component_index: merge overlapping rects only within same component (L vs big rect stay separate)
         by_comp: dict = defaultdict(list)
@@ -850,6 +893,11 @@ def run_clean_workflow(
         total_area = sum(_rect_area(s) for s in merged)
         MIN_SECTION_FRAC = 0.02
         remaining = [s for s in merged if total_area <= 0 or _rect_area(s) >= MIN_SECTION_FRAC * total_area]
+        _dbg(
+            f"pre-filter floor={floor_idx} path={Path(floor_path).name} "
+            f"sections_in={len(sections)} merged={len(merged)} remaining={len(remaining)} "
+            f"total_area={round(float(total_area), 2)} min_frac={MIN_SECTION_FRAC}"
+        )
         for s in remaining:
             s.pop("component_index", None)
         if not remaining:
@@ -865,17 +913,26 @@ def run_clean_workflow(
     def _norm_path(p: str) -> str:
         return str(Path(p).resolve())
     path_to_remaining: dict = {_norm_path(fp): rem for _fi, fp, rem in floors_to_output}
+    _dbg("initial path_to_remaining=" + str({Path(k).name: len(v) for k, v in path_to_remaining.items()}))
     if edited_json_path:
         edited_p = Path(edited_json_path)
         if edited_p.exists():
             edited_sections = _sections_from_edited_json(edited_p, len(all_floor_paths))
             if edited_sections:
+                _dbg(
+                    f"edited_json loaded path={edited_p} "
+                    f"floors={{{', '.join(f'{k}:{len(v)}' for k, v in sorted(edited_sections.items()))}}}"
+                )
                 # Suprascriem DOAR etajele prezente în JSON-ul editat.
                 # Dacă un etaj nu apare în fișier, păstrăm dreptunghiurile detectate automat.
                 for output_idx, floor_path in enumerate(all_floor_paths):
                     if output_idx in edited_sections:
                         path_to_remaining[_norm_path(floor_path)] = edited_sections[output_idx]
                 print(f"   ✓ Folosesc secțiuni editate din: {edited_p}")
+            else:
+                _dbg(f"edited_json path={edited_p} parsed_empty_or_invalid=True")
+        else:
+            _dbg(f"edited_json path={edited_p} exists=False")
     # Ordinea pentru overlay/offsets trebuie să fie all_floor_paths ca "0"/"1" să corespundă floor_0/floor_1
     ordered_paths = list(all_floor_paths)
     roof_results_ordered = []
@@ -954,20 +1011,29 @@ def run_clean_workflow(
         up_sections = path_to_remaining.get(up_key, [])
         lo_sections = path_to_remaining.get(lo_key, [])
         if not up_sections or not lo_sections:
+            _dbg(
+                f"pairwise skip up={upper_idx}({Path(up_path).name}) lo={lower_idx}({Path(lo_path).name}) "
+                f"up_sections={len(up_sections)} lo_sections={len(lo_sections)}"
+            )
             continue
 
         up_w, up_h = dims_by_path.get(up_path, (0, 0))
         lo_w, lo_h = dims_by_path.get(lo_path, (0, 0))
         if up_w <= 0 or up_h <= 0 or lo_w <= 0 or lo_h <= 0:
+            _dbg(
+                f"pairwise skip invalid dims up={upper_idx}:{up_w}x{up_h} lo={lower_idx}:{lo_w}x{lo_h}"
+            )
             continue
 
         up_largest_idx = _largest_section_idx(up_sections)
         lo_largest_idx = _largest_section_idx(lo_sections)
         if up_largest_idx is None or lo_largest_idx is None:
+            _dbg(f"pairwise skip largest none up={upper_idx} lo={lower_idx}")
             continue
         up_mask = _section_mask(up_sections[up_largest_idx], up_w, up_h)
         lo_mask = _section_mask(lo_sections[lo_largest_idx], lo_w, lo_h)
         if not up_mask.any() or not lo_mask.any():
+            _dbg(f"pairwise skip empty masks up={upper_idx} lo={lower_idx}")
             continue
 
         # Seed din offsets globale existente; apoi brute-force local pentru pereche.
@@ -995,6 +1061,11 @@ def run_clean_workflow(
 
         # După aliniere (fără rotații), eliminăm dreptunghiul inferior folosit la comparație.
         lower_filtered = [s for i, s in enumerate(lo_sections) if i != lo_largest_idx]
+        _dbg(
+            f"pairwise dedup up={upper_idx} lo={lower_idx} "
+            f"best_overlap={best_overlap} remove_lo_idx={lo_largest_idx} "
+            f"lo_before={len(lo_sections)} lo_after={len(lower_filtered)}"
+        )
         path_to_remaining[lo_key] = lower_filtered
 
     rectangles_dir = output_path / "rectangles"
@@ -1013,6 +1084,7 @@ def run_clean_workflow(
     for output_idx, floor_path in enumerate(all_floor_paths):
         remaining = path_to_remaining.get(_norm_path(floor_path), [])
         all_floors_with_remaining.append((output_idx, floor_path, remaining))
+        _dbg(f"final remaining floor={output_idx} path={Path(floor_path).name} count={len(remaining)}")
     floors_info = [{"floor_idx": output_idx, "path": str(Path(p).resolve())} for output_idx, p, _ in all_floors_with_remaining]
     (roof_types_dir / "floors_info.json").write_text(
         json.dumps(floors_info, indent=0), encoding="utf-8"
