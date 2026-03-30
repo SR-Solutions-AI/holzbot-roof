@@ -788,74 +788,6 @@ def run_clean_workflow(
     _dbg(f"angles_loaded path={fra_path} angles={floor_roof_angles}")
     default_angle = 30.0
 
-    floor_roof_results: List[dict] = []
-    for i, fp in enumerate(all_floor_paths):
-        angle = floor_roof_angles.get(i, default_angle)
-        # Validation allows roof_angle in [15, 60]; use clamped value for API, keep angle for footprint logic
-        api_angle = angle if 15 <= angle <= 60 else default_angle
-        _dbg(f"calculate start floor={i} angle={angle} api_angle={api_angle} overhang_px=2.0")
-        try:
-            res = calculate_roof_from_walls(fp, roof_angle=api_angle, overhang_px=2.0)
-            floor_roof_results.append(res)
-            sections = res.get("sections") or []
-            err = res.get("error")
-            _dbg(f"calculate done floor={i} sections={len(sections)} error={err!r}")
-        except Exception as e:
-            print(f"⚠ {Path(fp).name}: {e}", flush=True)
-            floor_roof_results = []
-            break
-
-    if len(floor_roof_results) != len(all_floor_paths):
-        floor_roof_results = []
-        for i, fp in enumerate(all_floor_paths):
-            angle = floor_roof_angles.get(i, default_angle)
-            api_angle = angle if 15 <= angle <= 60 else default_angle
-            try:
-                res = calculate_roof_from_walls(fp, roof_angle=api_angle, overhang_px=2.0)
-                floor_roof_results.append(res)
-                sections = res.get("sections") or []
-                err = res.get("error")
-                _dbg(f"calculate retry floor={i} sections={len(sections)} error={err!r}")
-            except Exception as e:
-                _dbg(f"calculate retry floor={i} raised={e!r}")
-                floor_roof_results.append({"sections": []})
-
-    # La unghi 0° (acoperiș plat), calculate_roof_from_walls poate returna sections goale → generăm 1 dreptunghi footprint
-    for i, fp in enumerate(all_floor_paths):
-        if i >= len(floor_roof_results):
-            continue
-        angle = floor_roof_angles.get(i, default_angle)
-        res = floor_roof_results[i]
-        sections = res.get("sections") or []
-        if angle == 0.0 and not sections:
-            footprint = _footprint_section_from_wall_mask(str(fp))
-            if footprint:
-                floor_roof_results[i] = {**res, "sections": [footprint]}
-                _dbg(f"footprint fallback floor={i} added=1")
-            else:
-                _dbg(f"footprint fallback floor={i} failed")
-
-    floors_ordered = _ordered_floor_polygons(all_floor_paths, None, floor_roof_results)
-    if not floors_ordered:
-        floors_ordered = [(p, None) for p in all_floor_paths]
-    _dbg(f"floors_ordered={[Path(p).name for p, _ in floors_ordered]}")
-
-    path_to_result = {all_floor_paths[i]: floor_roof_results[i] for i in range(len(all_floor_paths))}
-
-    # Compară dreptunghiuri între etaje: suprafață în pixeli, marjă ±10%
-    def _rect_area(sec):
-        br = sec.get("bounding_rect") or []
-        if len(br) < 3:
-            return 0.0
-        xs = [float(p[0]) for p in br]
-        ys = [float(p[1]) for p in br]
-        return (max(xs) - min(xs)) * (max(ys) - min(ys))
-
-    def _areas_match(a: float, b: float) -> bool:
-        if a <= 0 or b <= 0:
-            return False
-        return 0.9 * b <= a <= 1.1 * b or 0.9 * a <= b <= 1.1 * a
-
     basement_floor_index: Optional[int] = None
     bfi_path = output_path / "basement_floor_index.json"
     if bfi_path.exists():
@@ -868,71 +800,168 @@ def run_clean_workflow(
             basement_floor_index = None
     _dbg(f"basement_floor_index={basement_floor_index}")
 
-    floors_with_rects: List[Tuple[int, str, list]] = []
-    for floor_idx, (floor_path, _) in enumerate(floors_ordered):
-        # Beciul nu are acoperiș: nu extragem dreptunghiuri de acoperiș pentru acest etaj.
-        if basement_floor_index is not None and floor_idx == basement_floor_index:
-            continue
-        res = path_to_result.get(floor_path)
-        if res is None:
-            _dbg(f"pre-filter floor={floor_idx} path={Path(floor_path).name} result=missing")
-            continue
-        sections = res.get("sections") or []
-        if not sections:
-            _dbg(f"pre-filter floor={floor_idx} path={Path(floor_path).name} sections=0 error={res.get('error')!r}")
-            continue
-        # Group by component_index: merge overlapping rects only within same component (L vs big rect stay separate)
-        by_comp: dict = defaultdict(list)
-        for s in sections:
-            cid = s.get("component_index", 0)
-            by_comp[cid].append(s)
-        merged = []
-        for _cid in sorted(by_comp.keys()):
-            merged.extend(remove_overlapping_rectangles(by_comp[_cid], iou_threshold=0.3))
-        # Drop very small sections (e.g. meaningless S2 from decomposition tail)
-        total_area = sum(_rect_area(s) for s in merged)
-        MIN_SECTION_FRAC = 0.02
-        remaining = [s for s in merged if total_area <= 0 or _rect_area(s) >= MIN_SECTION_FRAC * total_area]
-        _dbg(
-            f"pre-filter floor={floor_idx} path={Path(floor_path).name} "
-            f"sections_in={len(sections)} merged={len(merged)} remaining={len(remaining)} "
-            f"total_area={round(float(total_area), 2)} min_frac={MIN_SECTION_FRAC}"
-        )
-        for s in remaining:
-            s.pop("component_index", None)
-        if not remaining:
-            continue
-        floors_with_rects.append((floor_idx, floor_path, remaining))
+    # Dacă engine trimite poligoane din editor: NU rulăm deloc extract/dedup de dreptunghiuri din mască.
+    edited_sections_early: Optional[Dict[int, list]] = None
+    edited_path_resolved: Optional[Path] = None
+    if edited_json_path:
+        edited_path_resolved = Path(edited_json_path)
+        if edited_path_resolved.exists():
+            edited_sections_early = _sections_from_edited_json(edited_path_resolved, len(all_floor_paths))
+            if not edited_sections_early:
+                edited_sections_early = None
 
-    # Keep rectangles per-floor as detected (except basement filter above).
-    # Cross-floor area matching/dedup can incorrectly drop valid sections on non-flat levels.
-    floors_to_output: List[Tuple[int, str, list]] = sorted(floors_with_rects, key=lambda t: t[0])
+    floor_roof_results: List[dict] = []
+    if edited_sections_early is not None:
+        _dbg("editor polygons only: skipping calculate_roof_from_walls and auto pre-filter")
+        for i in range(len(all_floor_paths)):
+            floor_roof_results.append({"sections": list(edited_sections_early.get(i, []))})
+        for i, fp in enumerate(all_floor_paths):
+            if i >= len(floor_roof_results):
+                continue
+            angle = floor_roof_angles.get(i, default_angle)
+            res = floor_roof_results[i]
+            sections = res.get("sections") or []
+            if angle == 0.0 and not sections:
+                footprint = _footprint_section_from_wall_mask(str(fp))
+                if footprint:
+                    floor_roof_results[i] = {**res, "sections": [footprint]}
+                    _dbg(f"footprint fallback floor={i} added=1")
+                else:
+                    _dbg(f"footprint fallback floor={i} failed")
+    else:
+        for i, fp in enumerate(all_floor_paths):
+            angle = floor_roof_angles.get(i, default_angle)
+            api_angle = angle if 15 <= angle <= 60 else default_angle
+            _dbg(f"calculate start floor={i} angle={angle} api_angle={api_angle} overhang_px=2.0")
+            try:
+                res = calculate_roof_from_walls(fp, roof_angle=api_angle, overhang_px=2.0)
+                floor_roof_results.append(res)
+                sections = res.get("sections") or []
+                err = res.get("error")
+                _dbg(f"calculate done floor={i} sections={len(sections)} error={err!r}")
+            except Exception as e:
+                print(f"⚠ {Path(fp).name}: {e}", flush=True)
+                floor_roof_results = []
+                break
 
-    # Pentru foldere rectangles/ și roof_types/: procesăm TOATE etajele (inclusiv 0_w fără secțiuni)
-    # Asociem remaining STRICT după path (nu după poziție), apoi iterăm all_floor_paths ca output_idx să fie mereu 0,1,2...
+        if len(floor_roof_results) != len(all_floor_paths):
+            floor_roof_results = []
+            for i, fp in enumerate(all_floor_paths):
+                angle = floor_roof_angles.get(i, default_angle)
+                api_angle = angle if 15 <= angle <= 60 else default_angle
+                try:
+                    res = calculate_roof_from_walls(fp, roof_angle=api_angle, overhang_px=2.0)
+                    floor_roof_results.append(res)
+                    sections = res.get("sections") or []
+                    err = res.get("error")
+                    _dbg(f"calculate retry floor={i} sections={len(sections)} error={err!r}")
+                except Exception as e:
+                    _dbg(f"calculate retry floor={i} raised={e!r}")
+                    floor_roof_results.append({"sections": []})
+
+        for i, fp in enumerate(all_floor_paths):
+            if i >= len(floor_roof_results):
+                continue
+            angle = floor_roof_angles.get(i, default_angle)
+            res = floor_roof_results[i]
+            sections = res.get("sections") or []
+            if angle == 0.0 and not sections:
+                footprint = _footprint_section_from_wall_mask(str(fp))
+                if footprint:
+                    floor_roof_results[i] = {**res, "sections": [footprint]}
+                    _dbg(f"footprint fallback floor={i} added=1")
+                else:
+                    _dbg(f"footprint fallback floor={i} failed")
+
+    floors_ordered = _ordered_floor_polygons(all_floor_paths, None, floor_roof_results)
+    if not floors_ordered:
+        floors_ordered = [(p, None) for p in all_floor_paths]
+    _dbg(f"floors_ordered={[Path(p).name for p, _ in floors_ordered]}")
+
+    path_to_result = {all_floor_paths[i]: floor_roof_results[i] for i in range(len(all_floor_paths))}
+
     def _norm_path(p: str) -> str:
         return str(Path(p).resolve())
-    path_to_remaining: dict = {_norm_path(fp): rem for _fi, fp, rem in floors_to_output}
-    _dbg("initial path_to_remaining=" + str({Path(k).name: len(v) for k, v in path_to_remaining.items()}))
-    if edited_json_path:
-        edited_p = Path(edited_json_path)
-        if edited_p.exists():
-            edited_sections = _sections_from_edited_json(edited_p, len(all_floor_paths))
-            if edited_sections:
-                _dbg(
-                    f"edited_json loaded path={edited_p} "
-                    f"floors={{{', '.join(f'{k}:{len(v)}' for k, v in sorted(edited_sections.items()))}}}"
-                )
-                # Suprascriem DOAR etajele prezente în JSON-ul editat.
-                # Dacă un etaj nu apare în fișier, păstrăm dreptunghiurile detectate automat.
-                for output_idx, floor_path in enumerate(all_floor_paths):
-                    if output_idx in edited_sections:
-                        path_to_remaining[_norm_path(floor_path)] = edited_sections[output_idx]
-                print(f"   ✓ Folosesc secțiuni editate din: {edited_p}")
+
+    path_to_remaining: dict = {}
+    skip_cross_floor_rect_dedup = False
+
+    if edited_sections_early is not None:
+        skip_cross_floor_rect_dedup = True
+        for i, fp in enumerate(all_floor_paths):
+            if basement_floor_index is not None and i == basement_floor_index:
+                path_to_remaining[_norm_path(fp)] = []
             else:
-                _dbg(f"edited_json path={edited_p} parsed_empty_or_invalid=True")
-        else:
-            _dbg(f"edited_json path={edited_p} exists=False")
+                path_to_remaining[_norm_path(fp)] = list(edited_sections_early.get(i, []))
+        _dbg("initial path_to_remaining=" + str({Path(k).name: len(v) for k, v in path_to_remaining.items()}))
+        _dbg(
+            "editor json floors="
+            + "{"
+            + ", ".join(f"{k}:{len(v)}" for k, v in sorted(edited_sections_early.items()))
+            + "}"
+        )
+        print(f"   ✓ Acoperiș exclusiv din editor (fără algoritm dreptunghiuri): {edited_path_resolved}")
+    else:
+        def _rect_area(sec):
+            br = sec.get("bounding_rect") or []
+            if len(br) < 3:
+                return 0.0
+            xs = [float(p[0]) for p in br]
+            ys = [float(p[1]) for p in br]
+            return (max(xs) - min(xs)) * (max(ys) - min(ys))
+
+        floors_with_rects: List[Tuple[int, str, list]] = []
+        for floor_idx, (floor_path, _) in enumerate(floors_ordered):
+            if basement_floor_index is not None and floor_idx == basement_floor_index:
+                continue
+            res = path_to_result.get(floor_path)
+            if res is None:
+                _dbg(f"pre-filter floor={floor_idx} path={Path(floor_path).name} result=missing")
+                continue
+            sections = res.get("sections") or []
+            if not sections:
+                _dbg(f"pre-filter floor={floor_idx} path={Path(floor_path).name} sections=0 error={res.get('error')!r}")
+                continue
+            by_comp: dict = defaultdict(list)
+            for s in sections:
+                cid = s.get("component_index", 0)
+                by_comp[cid].append(s)
+            merged = []
+            for _cid in sorted(by_comp.keys()):
+                merged.extend(remove_overlapping_rectangles(by_comp[_cid], iou_threshold=0.3))
+            total_area = sum(_rect_area(s) for s in merged)
+            MIN_SECTION_FRAC = 0.02
+            remaining = [s for s in merged if total_area <= 0 or _rect_area(s) >= MIN_SECTION_FRAC * total_area]
+            _dbg(
+                f"pre-filter floor={floor_idx} path={Path(floor_path).name} "
+                f"sections_in={len(sections)} merged={len(merged)} remaining={len(remaining)} "
+                f"total_area={round(float(total_area), 2)} min_frac={MIN_SECTION_FRAC}"
+            )
+            for s in remaining:
+                s.pop("component_index", None)
+            if not remaining:
+                continue
+            floors_with_rects.append((floor_idx, floor_path, remaining))
+
+        floors_to_output: List[Tuple[int, str, list]] = sorted(floors_with_rects, key=lambda t: t[0])
+        path_to_remaining = {_norm_path(fp): rem for _fi, fp, rem in floors_to_output}
+        _dbg("initial path_to_remaining=" + str({Path(k).name: len(v) for k, v in path_to_remaining.items()}))
+        if edited_json_path:
+            edited_p = Path(edited_json_path)
+            if edited_p.exists():
+                edited_sections = _sections_from_edited_json(edited_p, len(all_floor_paths))
+                if edited_sections:
+                    skip_cross_floor_rect_dedup = True
+                    _dbg(
+                        f"edited_json merged (partial) path={edited_p} "
+                        f"floors={{{', '.join(f'{k}:{len(v)}' for k, v in sorted(edited_sections.items()))}}}"
+                    )
+                    for output_idx, floor_path in enumerate(all_floor_paths):
+                        if output_idx in edited_sections:
+                            path_to_remaining[_norm_path(floor_path)] = edited_sections[output_idx]
+                    print(f"   ✓ Folosesc secțiuni editate din: {edited_p}")
+            else:
+                _dbg(f"edited_json path={edited_p} exists=False")
     # Ordinea pentru overlay/offsets trebuie să fie all_floor_paths ca "0"/"1" să corespundă floor_0/floor_1
     ordered_paths = list(all_floor_paths)
     roof_results_ordered = []
@@ -952,7 +981,7 @@ def run_clean_workflow(
         debug_output_dir=output_path / "overlay_debug",
     ) if len(ordered_paths) >= 2 else {}
 
-    # Pairwise top-down:
+    # Pairwise top-down (doar fără poligoane din editor):
     # pentru fiecare pereche vecină de etaje, aliniem BRUTE FORCE doar cel mai mare
     # dreptunghi de sus cu cel mai mare dreptunghi de jos (fără rotații),
     # apoi eliminăm dreptunghiul de la etajul inferior.
@@ -1002,71 +1031,74 @@ def run_clean_workflow(
         else:
             dims_by_path[fp] = (int(img.shape[1]), int(img.shape[0]))
 
-    for upper_idx in range(0, len(all_floor_paths) - 1):
-        lower_idx = upper_idx + 1
-        up_path = all_floor_paths[upper_idx]
-        lo_path = all_floor_paths[lower_idx]
-        up_key = _norm_path(up_path)
-        lo_key = _norm_path(lo_path)
-        up_sections = path_to_remaining.get(up_key, [])
-        lo_sections = path_to_remaining.get(lo_key, [])
-        if not up_sections or not lo_sections:
-            _dbg(
-                f"pairwise skip up={upper_idx}({Path(up_path).name}) lo={lower_idx}({Path(lo_path).name}) "
-                f"up_sections={len(up_sections)} lo_sections={len(lo_sections)}"
-            )
-            continue
+    if skip_cross_floor_rect_dedup:
+        _dbg("pairwise dedup skipped (sections from edited_json — keep all editor rectangles per floor)")
+    else:
+        for upper_idx in range(0, len(all_floor_paths) - 1):
+            lower_idx = upper_idx + 1
+            up_path = all_floor_paths[upper_idx]
+            lo_path = all_floor_paths[lower_idx]
+            up_key = _norm_path(up_path)
+            lo_key = _norm_path(lo_path)
+            up_sections = path_to_remaining.get(up_key, [])
+            lo_sections = path_to_remaining.get(lo_key, [])
+            if not up_sections or not lo_sections:
+                _dbg(
+                    f"pairwise skip up={upper_idx}({Path(up_path).name}) lo={lower_idx}({Path(lo_path).name}) "
+                    f"up_sections={len(up_sections)} lo_sections={len(lo_sections)}"
+                )
+                continue
 
-        up_w, up_h = dims_by_path.get(up_path, (0, 0))
-        lo_w, lo_h = dims_by_path.get(lo_path, (0, 0))
-        if up_w <= 0 or up_h <= 0 or lo_w <= 0 or lo_h <= 0:
-            _dbg(
-                f"pairwise skip invalid dims up={upper_idx}:{up_w}x{up_h} lo={lower_idx}:{lo_w}x{lo_h}"
-            )
-            continue
+            up_w, up_h = dims_by_path.get(up_path, (0, 0))
+            lo_w, lo_h = dims_by_path.get(lo_path, (0, 0))
+            if up_w <= 0 or up_h <= 0 or lo_w <= 0 or lo_h <= 0:
+                _dbg(
+                    f"pairwise skip invalid dims up={upper_idx}:{up_w}x{up_h} lo={lower_idx}:{lo_w}x{lo_h}"
+                )
+                continue
 
-        up_largest_idx = _largest_section_idx(up_sections)
-        lo_largest_idx = _largest_section_idx(lo_sections)
-        if up_largest_idx is None or lo_largest_idx is None:
-            _dbg(f"pairwise skip largest none up={upper_idx} lo={lower_idx}")
-            continue
-        up_mask = _section_mask(up_sections[up_largest_idx], up_w, up_h)
-        lo_mask = _section_mask(lo_sections[lo_largest_idx], lo_w, lo_h)
-        if not up_mask.any() or not lo_mask.any():
-            _dbg(f"pairwise skip empty masks up={upper_idx} lo={lower_idx}")
-            continue
+            up_largest_idx = _largest_section_idx(up_sections)
+            lo_largest_idx = _largest_section_idx(lo_sections)
+            if up_largest_idx is None or lo_largest_idx is None:
+                _dbg(f"pairwise skip largest none up={upper_idx} lo={lower_idx}")
+                continue
+            up_mask = _section_mask(up_sections[up_largest_idx], up_w, up_h)
+            lo_mask = _section_mask(lo_sections[lo_largest_idx], lo_w, lo_h)
+            if not up_mask.any() or not lo_mask.any():
+                _dbg(f"pairwise skip empty masks up={upper_idx} lo={lower_idx}")
+                continue
 
-        # Seed din offsets globale existente; apoi brute-force local pentru pereche.
-        up_off = offsets_by_path.get(up_path, (0.0, 0.0))
-        lo_off = offsets_by_path.get(lo_path, (0.0, 0.0))
-        dx0 = int(round(up_off[0] - lo_off[0]))
-        dy0 = int(round(up_off[1] - lo_off[1]))
-        step = max(1, min(up_w, up_h, lo_w, lo_h) // 90)
-        search = max(20, min(220, int(max(up_w, up_h, lo_w, lo_h) * 0.12)))
-        best_overlap = -1
-        best_dx, best_dy = dx0, dy0
-        for dx in range(dx0 - search, dx0 + search + 1, step):
-            for dy in range(dy0 - search, dy0 + search + 1, step):
-                ov = _overlap_area_at_offset(up_mask, up_w, up_h, lo_mask, lo_w, lo_h, dx, dy)
-                if ov > best_overlap:
-                    best_overlap = ov
-                    best_dx, best_dy = dx, dy
-        if step > 1:
-            for dx in range(best_dx - step, best_dx + step + 1):
-                for dy in range(best_dy - step, best_dy + step + 1):
+            # Seed din offsets globale existente; apoi brute-force local pentru pereche.
+            up_off = offsets_by_path.get(up_path, (0.0, 0.0))
+            lo_off = offsets_by_path.get(lo_path, (0.0, 0.0))
+            dx0 = int(round(up_off[0] - lo_off[0]))
+            dy0 = int(round(up_off[1] - lo_off[1]))
+            step = max(1, min(up_w, up_h, lo_w, lo_h) // 90)
+            search = max(20, min(220, int(max(up_w, up_h, lo_w, lo_h) * 0.12)))
+            best_overlap = -1
+            best_dx, best_dy = dx0, dy0
+            for dx in range(dx0 - search, dx0 + search + 1, step):
+                for dy in range(dy0 - search, dy0 + search + 1, step):
                     ov = _overlap_area_at_offset(up_mask, up_w, up_h, lo_mask, lo_w, lo_h, dx, dy)
                     if ov > best_overlap:
                         best_overlap = ov
                         best_dx, best_dy = dx, dy
+            if step > 1:
+                for dx in range(best_dx - step, best_dx + step + 1):
+                    for dy in range(best_dy - step, best_dy + step + 1):
+                        ov = _overlap_area_at_offset(up_mask, up_w, up_h, lo_mask, lo_w, lo_h, dx, dy)
+                        if ov > best_overlap:
+                            best_overlap = ov
+                            best_dx, best_dy = dx, dy
 
-        # După aliniere (fără rotații), eliminăm dreptunghiul inferior folosit la comparație.
-        lower_filtered = [s for i, s in enumerate(lo_sections) if i != lo_largest_idx]
-        _dbg(
-            f"pairwise dedup up={upper_idx} lo={lower_idx} "
-            f"best_overlap={best_overlap} remove_lo_idx={lo_largest_idx} "
-            f"lo_before={len(lo_sections)} lo_after={len(lower_filtered)}"
-        )
-        path_to_remaining[lo_key] = lower_filtered
+            # După aliniere (fără rotații), eliminăm dreptunghiul inferior folosit la comparație.
+            lower_filtered = [s for i, s in enumerate(lo_sections) if i != lo_largest_idx]
+            _dbg(
+                f"pairwise dedup up={upper_idx} lo={lower_idx} "
+                f"best_overlap={best_overlap} remove_lo_idx={lo_largest_idx} "
+                f"lo_before={len(lo_sections)} lo_after={len(lower_filtered)}"
+            )
+            path_to_remaining[lo_key] = lower_filtered
 
     rectangles_dir = output_path / "rectangles"
     roof_types_dir = output_path / "roof_types"
