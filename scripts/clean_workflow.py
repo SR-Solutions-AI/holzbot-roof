@@ -681,9 +681,17 @@ def _sections_from_edited_json(
                     arr.append([float(p[0]), float(p[1])])
             if len(arr) < 3:
                 continue
+            # Drop duplicate closing vertex (editor often repeats first point).
+            if len(arr) >= 2:
+                a0, a1 = arr[0], arr[-1]
+                if abs(a0[0] - a1[0]) < 1e-6 and abs(a0[1] - a1[1]) < 1e-6:
+                    arr = arr[:-1]
+            if len(arr) < 3:
+                continue
             np_pts = np.array(arr, dtype=np.float32)
             rect = cv2.minAreaRect(np_pts)
-            box = cv2.boxPoints(rect).tolist()
+            # Footprint = exact user polygon (L, U, …). Ridge still from min-area rect for gable heuristics.
+            footprint = [(float(p[0]), float(p[1])) for p in arr]
             (cx, cy), (rw, rh), _ang = rect
             if rw >= rh:
                 ridge = [(float(cx - rw * 0.5), float(cy)), (float(cx + rw * 0.5), float(cy))]
@@ -693,7 +701,7 @@ def _sections_from_edited_json(
                 orientation = "vertical"
             sections.append(
                 {
-                    "bounding_rect": [(float(p[0]), float(p[1])) for p in box],
+                    "bounding_rect": footprint,
                     "ridge_line": ridge,
                     "ridge_orientation": orientation,
                     "is_main": False,
